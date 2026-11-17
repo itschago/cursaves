@@ -493,13 +493,39 @@ def export_conversation(
 
 
 def _compress_snapshot(snapshot: dict) -> bytes:
-    """Compress a snapshot dict to gzip bytes."""
-    json_bytes = json.dumps(snapshot, ensure_ascii=False).encode("utf-8")
+    """Compress a snapshot dict to gzip bytes.
+
+    The gzip header timestamp is fixed (mtime=0) so identical snapshots
+    produce identical bytes and don't show up as changes in git.
+    """
+    json_bytes = json.dumps(snapshot, ensure_ascii=False, sort_keys=True).encode("utf-8")
     import io
     buf = io.BytesIO()
-    with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=9) as f:
+    with gzip.GzipFile(fileobj=buf, mode="wb", compresslevel=9, mtime=0) as f:
         f.write(json_bytes)
     return buf.getvalue()
+
+
+def _snapshot_content_hash(snapshot: dict) -> str:
+    """Hash of everything in a snapshot except when it was exported."""
+    import hashlib
+
+    content = {k: v for k, v in snapshot.items() if k != "exportedAt"}
+    data = json.dumps(content, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return hashlib.sha256(data).hexdigest()
+
+
+def _unchanged_since_last_save(project_dir: Path, composer_id: str, content_hash: str) -> bool:
+    meta_file = project_dir / f"{composer_id}.meta.json"
+    try:
+        meta = json.loads(meta_file.read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if meta.get("contentHash") != content_hash:
+        return False
+    return (project_dir / f"{composer_id}.json.gz").exists() or (
+        project_dir / f"{composer_id}.json.gz.00"
+    ).exists()
 
 
 def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
@@ -524,7 +550,13 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
     old_file = project_dir / f"{composer_id}.json"
     if old_file.exists():
         old_file.unlink()
-    
+
+    # Leave files untouched when nothing but exportedAt changed, so
+    # re-checkpointing doesn't commit a new copy of every chat.
+    content_hash = _snapshot_content_hash(snapshot)
+    if _unchanged_since_last_save(project_dir, composer_id, content_hash):
+        return project_dir / f"{composer_id}.json.gz"
+
     # Compress and check size
     max_size = MAX_COMPRESSED_SIZE_MB * 1024 * 1024
     compressed = _compress_snapshot(snapshot)
@@ -577,6 +609,10 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
         "composerId": composer_id,
         "name": cd.get("name"),
         "messageCount": len(cd.get("fullConversationHeadersOnly", [])),
+        "headerIds": [
+            h["bubbleId"] for h in cd.get("fullConversationHeadersOnly", [])
+            if h.get("bubbleId")
+        ],
         "exportedAt": snapshot.get("exportedAt"),
         "sourceMachine": snapshot.get("sourceMachine"),
         "sourceHost": snapshot.get("sourceHost"),
@@ -584,6 +620,7 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
         "projectIdentifier": snapshot.get("projectIdentifier"),
         "version": snapshot.get("version"),
         "shardCount": num_shards if num_shards else None,
+        "contentHash": content_hash,
     }
     meta_file = project_dir / f"{composer_id}.meta.json"
     meta_file.write_text(json.dumps(meta, indent=2))

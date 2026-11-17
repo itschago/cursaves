@@ -3,13 +3,12 @@
 import gzip
 import json
 import os
-import subprocess
 import sys
 import uuid
 from pathlib import Path
 from typing import Any, Optional
 
-from . import db, paths
+from . import db, paths, sync_state
 
 
 def _get_shard_paths(base_path: Path) -> list[Path]:
@@ -83,6 +82,7 @@ def read_snapshot_meta(snapshot_path: Path) -> dict:
             "composerId": data.get("composerId"),
             "name": cd.get("name"),
             "messageCount": len(cd.get("fullConversationHeadersOnly", [])),
+            "headerIds": header_ids(cd),
             "exportedAt": data.get("exportedAt"),
             "sourceMachine": data.get("sourceMachine"),
             "sourceHost": data.get("sourceHost"),
@@ -102,29 +102,7 @@ def read_snapshot_meta(snapshot_path: Path) -> dict:
 
 
 def is_cursor_running() -> bool:
-    """Check if the main Cursor app process is running.
-
-    On macOS, pgrep -x fails because the comm field is truncated to 16
-    characters. Instead we parse `ps -axo args` and look for the main
-    Cursor executable while excluding helpers, crash handlers, and the
-    macOS CursorUIViewService system process.
-    """
-    try:
-        result = subprocess.run(
-            ["ps", "-axo", "args"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            return False
-        for line in result.stdout.splitlines():
-            if "Cursor.app/Contents/MacOS/Cursor" in line \
-                    and "Helper" not in line \
-                    and "Frameworks" not in line:
-                return True
-        return False
-    except FileNotFoundError:
-        return False
+    return paths.is_cursor_running()
 
 
 _SKIP_REWRITE_KEYS = frozenset({"conversationState"})
@@ -348,23 +326,33 @@ def import_snapshot(
     if conflict == "diverged":
         # Both local and incoming have unique messages — they've branched.
         # Keep the local version untouched and import the incoming snapshot
-        # as a separate conversation with a new ID and a renamed title.
-        new_id = str(uuid.uuid4())
-        new_name = f"{chat_name} (from {source_label})"
-        composer_data["composerId"] = new_id
-        composer_data["name"] = new_name
-        composer_id = new_id
+        # as a separate conversation. The copy's ID is derived from the
+        # original ID and source, so later syncs update the same copy
+        # instead of creating a new duplicate each time.
+        copy_id = diverged_copy_id(composer_id, source_label)
+        copy_name = f"{chat_name} (from {source_label})"
         print(
             f"  Diverged: \"{chat_name}\" — local and {source_label} both have unique messages"
         )
-        print(
-            f"            Importing as separate chat: \"{new_name}\""
+        copy_state = _check_conflict(
+            global_db_path, copy_id, incoming_bubble_ids, incoming_header_ids,
         )
+        if copy_state == "identical":
+            print(f"            Separate copy \"{copy_name}\" is already up to date")
+            return True
+        if copy_state in ("local_ahead", "diverged"):
+            print(f"            Separate copy \"{copy_name}\" has local changes; leaving it unchanged")
+            return True
+        action = "Importing" if copy_state == "new" else "Updating"
+        print(f"            {action} separate chat: \"{copy_name}\"")
+        composer_data["composerId"] = copy_id
+        composer_data["name"] = copy_name
+        composer_id = copy_id
 
     # ── Step 1: Backup global DB ────────────────────────────────────
     if not skip_backup and global_db_path.exists():
         backup_path = db.backup_db(global_db_path)
-        print(f"  Backed up global DB to {backup_path.name}")
+        print(f"  Backed up global DB to {backup_path}")
 
     # ── Step 2: Write conversation data to global DB ────────────────
     global_cdb = db.CursorDB(global_db_path)
@@ -428,7 +416,7 @@ def import_snapshot(
 
     if not skip_backup and ws_db_path.exists():
         backup_path = db.backup_db(ws_db_path)
-        print(f"  Backed up workspace DB to {backup_path.name}")
+        print(f"  Backed up workspace DB to {backup_path}")
 
     _register_in_workspace(composer_id, composer_data, ws_dir)
 
@@ -451,6 +439,7 @@ def import_snapshot(
         if conflict == "new":
             print(f"  Imported: \"{final_name}\" ({final_msgs} msgs, {len(bubble_entries)} bubbles)")
         elif conflict == "diverged":
+            sync_state.record_diverged_copy(composer_id)
             print(f"  Copied: \"{final_name}\" ({final_msgs} msgs) — original \"{chat_name}\" left unchanged")
         elif conflict == "incoming_newer":
             print(f"  Updated: \"{final_name}\" → {final_msgs} msgs")
@@ -462,23 +451,66 @@ def import_snapshot(
     return True
 
 
+def diverged_copy_id(composer_id: str, source_label: str) -> str:
+    """Stable ID for the local copy of a diverged remote version of a chat."""
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"cursaves-diverged:{composer_id}:{source_label}"))
+
+
+def header_ids(composer_data: dict) -> list[str]:
+    """Ordered message (bubble) IDs from a composerData dict."""
+    return [
+        h["bubbleId"] for h in composer_data.get("fullConversationHeadersOnly", [])
+        if h.get("bubbleId")
+    ]
+
+
+def compare_message_ids(
+    local_ids: list[str],
+    snapshot_ids: Optional[list[str]],
+    snapshot_count: int,
+) -> str:
+    """Classify a local chat against a snapshot.
+
+    Uses message IDs when the snapshot metadata has them, so a chat that
+    gained different messages on two machines is reported as "diverged"
+    rather than whichever side has more messages looking "ahead".
+    Falls back to comparing counts for older snapshots without IDs.
+
+    Returns "up_to_date", "local_ahead", "behind", or "diverged".
+    """
+    if snapshot_ids is None:
+        local_count = len(local_ids)
+        if local_count == snapshot_count:
+            return "up_to_date"
+        return "local_ahead" if local_count > snapshot_count else "behind"
+
+    local, snap = set(local_ids), set(snapshot_ids)
+    if local == snap:
+        return "up_to_date"
+    if snap < local:
+        return "local_ahead"
+    if local < snap:
+        return "behind"
+    return "diverged"
+
+
 def get_sync_status_for_snapshot(
     composer_id: str,
     snapshot_msg_count: int,
     _cdb: "Optional[db.CursorDB]" = None,
+    snapshot_header_ids: Optional[list[str]] = None,
 ) -> str:
-    """Lightweight sync status check using only message counts.
-
-    Compares the local header count against the snapshot's messageCount
-    from the .meta.json sidecar (no decompression needed).
+    """Lightweight sync status check from the .meta.json sidecar
+    (no decompression needed). Pass the sidecar's headerIds when present.
 
     Pass an open CursorDB via _cdb to avoid re-copying the global DB.
 
     Returns one of:
       "not_local"     - conversation doesn't exist in local DB
-      "up_to_date"    - same message count
-      "local_ahead"   - local has more messages than snapshot
-      "behind"        - snapshot has more messages than local
+      "up_to_date"    - same messages
+      "local_ahead"   - local has every snapshot message plus more
+      "behind"        - snapshot has every local message plus more
+      "diverged"      - each side has messages the other lacks
     """
     if _cdb is not None:
         local_data = _cdb.get_json(f"composerData:{composer_id}")
@@ -492,14 +524,7 @@ def get_sync_status_for_snapshot(
     if not local_data:
         return "not_local"
 
-    local_count = len(local_data.get("fullConversationHeadersOnly", []))
-
-    if local_count == snapshot_msg_count:
-        return "up_to_date"
-    elif local_count > snapshot_msg_count:
-        return "local_ahead"
-    else:
-        return "behind"
+    return compare_message_ids(header_ids(local_data), snapshot_header_ids, snapshot_msg_count)
 
 
 def get_push_status_for_conversation(
@@ -513,9 +538,10 @@ def get_push_status_for_conversation(
 
     Returns one of:
       "never_pushed"  - no snapshot exists for this conversation
-      "up_to_date"    - snapshot matches local message count
-      "local_ahead"   - local has more messages than the snapshot
+      "up_to_date"    - snapshot has the same messages
+      "local_ahead"   - local has every snapshot message plus more
       "behind"        - snapshot has more messages (pushed from elsewhere)
+      "diverged"      - each side has messages the other lacks
     """
     snapshots_dir = paths.get_snapshots_dir()
     project_dir = snapshots_dir / project_identifier
@@ -543,14 +569,7 @@ def get_push_status_for_conversation(
     if not local_data:
         return "never_pushed"
 
-    local_count = len(local_data.get("fullConversationHeadersOnly", []))
-
-    if local_count == snapshot_count:
-        return "up_to_date"
-    elif local_count > snapshot_count:
-        return "local_ahead"
-    else:
-        return "behind"
+    return compare_message_ids(header_ids(local_data), meta.get("headerIds"), snapshot_count)
 
 
 _SYNC_STATUS_LABELS = {
@@ -558,6 +577,7 @@ _SYNC_STATUS_LABELS = {
     "up_to_date": "synced",
     "local_ahead": "ahead",
     "behind": "behind",
+    "diverged": "diverged",
     "never_pushed": "not pushed",
 }
 
@@ -698,7 +718,7 @@ def import_from_snapshot_dir(
     global_db_path = paths.get_global_db_path()
     if global_db_path.exists():
         backup_path = db.backup_db(global_db_path)
-        print(f"Backed up global DB to {backup_path.name}")
+        print(f"Backed up global DB to {backup_path}")
 
     if target_workspace_dir is not None:
         ws_dir = target_workspace_dir
@@ -707,7 +727,7 @@ def import_from_snapshot_dir(
     ws_db_path = ws_dir / "state.vscdb"
     if ws_db_path.exists():
         backup_path = db.backup_db(ws_db_path)
-        print(f"Backed up workspace DB to {backup_path.name}")
+        print(f"Backed up workspace DB to {backup_path}")
 
     success = 0
     failure = 0
@@ -1172,7 +1192,7 @@ def repair_missing_blobs(verbose: bool = False) -> tuple[int, int]:
     # Phase 3: Write restored blobs to the global DB
     backup_path = db.backup_db(global_db_path)
     if verbose:
-        print(f"  Backed up global DB to {backup_path.name}")
+        print(f"  Backed up global DB to {backup_path}")
 
     with db.CursorDB(global_db_path) as cdb:
         cdb.write_batch([
@@ -1593,7 +1613,7 @@ def migrate_to_global_headers(
         return len(final_entries), already_present
 
     backup_path = db.backup_db(global_db_path)
-    print(f"Backed up global DB to {backup_path.name}")
+    print(f"Backed up global DB to {backup_path}")
 
     headers["allComposers"].extend(final_entries)
     write_cdb = db.CursorDB(global_db_path)
@@ -1738,7 +1758,7 @@ def purge_chats(
         return 0, 0
 
     backup_path = db.backup_db(global_db_path)
-    print(f"  Backed up global DB to {backup_path.name}")
+    print(f"  Backed up global DB to {backup_path}")
 
     cid_set = set(composer_ids)
     total_keys = 0
