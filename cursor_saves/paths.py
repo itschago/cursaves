@@ -470,6 +470,15 @@ def get_sync_dir() -> Path:
     return Path.home() / ".cursaves"
 
 
+def get_backups_dir() -> Path:
+    """Return the directory for Cursor DB backups.
+
+    Deliberately outside ~/.cursaves/: the git backend runs `git clean`
+    there, which would delete untracked backups.
+    """
+    return Path.home() / ".local" / "share" / "cursaves" / "backups"
+
+
 def get_snapshots_dir() -> Path:
     """Return the snapshots directory (~/.cursaves/snapshots/)."""
     snapshots = get_sync_dir() / "snapshots"

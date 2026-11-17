@@ -57,24 +57,16 @@ class CursorDB:
         if not self.db_path.exists():
             raise FileNotFoundError(f"Database not found: {self.db_path}")
 
-        # Copy the main db file and any WAL/SHM files
         tmp_dir = tempfile.mkdtemp(prefix="cursaves-")
         tmp_db = Path(tmp_dir) / "state.vscdb"
-        shutil.copy2(self.db_path, tmp_db)
-
-        # Also copy WAL and SHM if they exist (needed for recent writes)
-        for suffix in ("-wal", "-shm"):
-            wal_file = self.db_path.parent / (self.db_path.name + suffix)
-            if wal_file.exists():
-                shutil.copy2(wal_file, Path(tmp_dir) / (tmp_db.name + suffix))
+        try:
+            snapshot_sqlite_db(self.db_path, tmp_db)
+        except BaseException:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
 
         self._tmp_path = tmp_db
         self._conn = sqlite3.connect(str(tmp_db))
-        # Checkpoint WAL into main db for consistent reads
-        try:
-            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        except sqlite3.OperationalError:
-            pass  # Not in WAL mode, that's fine
         return self._conn
 
     def close(self):
@@ -279,37 +271,92 @@ class CursorDB:
 
 
 
-def backup_db(db_path: Path, keep: int = 2) -> Path:
-    """Create a timestamped backup of a database file.
+def snapshot_sqlite_db(src_path: Path, dest_path: Path) -> None:
+    """Write a consistent single-file copy of a live SQLite database.
 
-    Keeps only the most recent `keep` backups (default 2) and deletes
-    older ones to prevent unbounded disk usage. The global DB can be
-    multi-GB, so even a handful of stale backups can fill a disk.
+    Uses SQLite's online backup API through a read-only connection, so the
+    copy reflects one committed state even while Cursor is writing (copying
+    the main file and its -wal separately can capture two different states).
+    """
+    try:
+        src = sqlite3.connect(f"{src_path.resolve().as_uri()}?mode=ro", uri=True)
+    except sqlite3.OperationalError:
+        _copy_db_files(src_path, dest_path)
+        return
+    try:
+        dest = sqlite3.connect(str(dest_path))
+        try:
+            src.backup(dest)
+            dest.execute("PRAGMA journal_mode=DELETE")
+        finally:
+            dest.close()
+    except sqlite3.OperationalError:
+        dest_path.unlink(missing_ok=True)
+        _copy_db_files(src_path, dest_path)
+    finally:
+        src.close()
+
+
+def _copy_db_files(src_path: Path, dest_path: Path) -> None:
+    """Fallback: raw-copy the database and its WAL, then fold the WAL in."""
+    shutil.copy2(src_path, dest_path)
+    for suffix in ("-wal", "-shm"):
+        side = src_path.parent / (src_path.name + suffix)
+        if side.exists():
+            shutil.copy2(side, dest_path.parent / (dest_path.name + suffix))
+    conn = sqlite3.connect(str(dest_path))
+    try:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.OperationalError:
+        pass
+    finally:
+        conn.close()
+
+
+def _backup_label(db_path: Path) -> str:
+    if db_path.parent.name == "globalStorage":
+        return "global"
+    return f"workspace-{db_path.parent.name}"
+
+
+def _prune_backups(backup_dir: Path, keep_recent: int, keep_daily: int) -> None:
+    """Keep the newest `keep_recent` backups plus the first backup of each of
+    the `keep_daily` most recent days, so repeated runs after a bad import
+    can't rotate out the last known-good state."""
+    backups = sorted(backup_dir.glob("state_*.vscdb"))  # names sort chronologically
+    keep = set(backups[-keep_recent:]) if keep_recent > 0 else set()
+    first_of_day: dict[str, Path] = {}
+    for b in backups:
+        first_of_day.setdefault(b.name[len("state_"):][:8], b)
+    for day in sorted(first_of_day)[-keep_daily:] if keep_daily > 0 else []:
+        keep.add(first_of_day[day])
+    for b in backups:
+        if b not in keep:
+            b.unlink(missing_ok=True)
+
+
+def backup_db(db_path: Path, keep_recent: int = 2, keep_daily: int = 3) -> Path:
+    """Create a timestamped backup of a Cursor database.
+
+    Backups go to ~/.local/share/cursaves/backups/<global|workspace-hash>/,
+    outside Cursor's own storage and outside the ~/.cursaves sync repo.
+    The global DB can be multi-GB, so retention is bounded: see
+    _prune_backups.
 
     Returns the path to the new backup.
     """
     from datetime import datetime
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = db_path.parent / f"{db_path.stem}.backup_{timestamp}{db_path.suffix}"
-    shutil.copy2(db_path, backup_path)
+    backup_dir = paths.get_backups_dir() / _backup_label(db_path)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    backup_path = backup_dir / f"state_{timestamp}.vscdb"
+    partial = backup_dir / f".{backup_path.name}.partial"
+    try:
+        snapshot_sqlite_db(db_path, partial)
+        partial.replace(backup_path)
+    finally:
+        partial.unlink(missing_ok=True)
 
-    for suffix in ("-wal", "-shm"):
-        wal = db_path.parent / (db_path.name + suffix)
-        if wal.exists():
-            shutil.copy2(wal, db_path.parent / (backup_path.name + suffix))
-
-    # Clean up old backups, keeping only the newest `keep`
-    pattern = f"{db_path.stem}.backup_*{db_path.suffix}"
-    old_backups = sorted(
-        db_path.parent.glob(pattern),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    for stale in old_backups[keep:]:
-        stale.unlink(missing_ok=True)
-        for suffix in ("-wal", "-shm"):
-            sidecar = stale.parent / (stale.name + suffix)
-            sidecar.unlink(missing_ok=True)
-
+    _prune_backups(backup_dir, keep_recent, keep_daily)
     return backup_path

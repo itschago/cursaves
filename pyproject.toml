@@ -27,3 +27,6 @@ dev = [
 
 [project.urls]
 Repository = "https://github.com/Callum-Ward/cursaves"
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tests"]

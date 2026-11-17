@@ -885,7 +885,8 @@ def _pull_behind(sync_dir: Path) -> int:
 
                 for ws in target_list:
                     if not backed_up_global and global_db_path.exists():
-                        db.backup_db(global_db_path)
+                        backup_path = db.backup_db(global_db_path)
+                        print(f"  Backed up global DB to {backup_path}")
                         backed_up_global = True
 
                     ws_dir_str = str(ws["workspace_dir"])
