@@ -1,5 +1,6 @@
 """Platform detection and Cursor storage path resolution."""
 
+import functools
 import json
 import os
 import platform
@@ -8,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 
 def get_cursor_user_dir() -> Path:
@@ -132,6 +133,17 @@ def _decode_ssh_host(host: str) -> str:
     return host
 
 
+def uri_to_path(uri: str) -> Optional[str]:
+    """Filesystem path from a workspace.json file:// or vscode-remote:// URI.
+
+    Paths are percent-encoded in these URIs (spaces, '#', non-ASCII, ...).
+    Returns None for other schemes.
+    """
+    if uri.startswith(("file://", "vscode-remote://")):
+        return unquote(urlsplit(uri).path) or "/"
+    return None
+
+
 def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
     """Find all workspace directories that map to a given project path.
 
@@ -154,21 +166,8 @@ def find_workspace_dirs_for_project(project_path: str) -> list[Path]:
             continue
         try:
             data = json.loads(ws_json.read_text())
-            folder_uri = data.get("folder", "")
-            # Handle file:// URIs
-            if folder_uri.startswith("file://"):
-                folder_path = folder_uri[len("file://") :]
-                # URL-decode common escapes
-                folder_path = folder_path.replace("%20", " ")
-            elif folder_uri.startswith("vscode-remote://"):
-                # SSH remote workspace - extract the path portion
-                # Format: vscode-remote://ssh-remote%2B<host>/<path>
-                parts = folder_uri.split("/", 3)
-                if len(parts) >= 4:
-                    folder_path = "/" + parts[3]
-                else:
-                    continue
-            else:
+            folder_path = uri_to_path(data.get("folder", ""))
+            if folder_path is None:
                 continue
 
             if os.path.normpath(folder_path) == target:
@@ -235,8 +234,7 @@ def list_all_workspaces() -> list[dict]:
                 ws_uri = data["workspace"]
                 if ws_uri.startswith("file://"):
                     folder_uri = ws_uri
-                    folder_path = ws_uri[len("file://") :]
-                    folder_path = folder_path.replace("%20", " ")
+                    folder_path = uri_to_path(ws_uri)
                     ws_type = "workspace"
                 else:
                     continue
@@ -245,27 +243,18 @@ def list_all_workspaces() -> list[dict]:
                 if not folder_uri:
                     continue
 
-                if folder_uri.startswith("file://"):
-                    folder_path = folder_uri[len("file://") :]
-                    folder_path = folder_path.replace("%20", " ")
-                elif folder_uri.startswith("vscode-remote://"):
+                folder_path = uri_to_path(folder_uri)
+                if folder_path is None:
+                    continue
+                if folder_uri.startswith("vscode-remote://"):
                     ws_type = "ssh"
                     # Format: vscode-remote://ssh-remote%2B<host>/<path>
-                    authority = folder_uri.split("/")[2]  # ssh-remote%2B<host>
-                    if "%2B" in authority:
-                        host = authority.split("%2B", 1)[1]
-                    elif "+" in authority:
+                    authority = unquote(urlsplit(folder_uri).netloc)
+                    if "+" in authority:
                         host = authority.split("+", 1)[1]
                     # Decode the host if it's hex-encoded JSON (e.g. {"hostName":"core"})
                     if host:
                         host = _decode_ssh_host(host)
-                    parts = folder_uri.split("/", 3)
-                    if len(parts) >= 4:
-                        folder_path = "/" + parts[3]
-                    else:
-                        continue
-                else:
-                    continue
 
             # Get DB modification time
             db_path = ws_dir / "state.vscdb"
@@ -287,50 +276,42 @@ def list_all_workspaces() -> list[dict]:
     return workspaces
 
 
-def get_global_composer_headers() -> list[dict]:
-    """Read the central composer.composerHeaders from the global DB.
-
-    Returns the allComposers list from composer.composerHeaders in the
-    global DB's ItemTable. In Cursor 3.0+ this is the authoritative
-    index of all chats, each tagged with a workspaceIdentifier.
-
-    Returns an empty list if not present (pre-3.0 Cursor).
-    """
-    from . import db
-
-    global_db = get_global_db_path()
-    if not global_db.exists():
-        return []
-    try:
-        with db.CursorDB(global_db) as cdb:
-            headers = cdb.get_json("composer.composerHeaders", table="ItemTable")
-            if headers and isinstance(headers, dict):
-                return headers.get("allComposers", [])
-    except Exception:
-        pass
-    return []
-
-
 _global_headers_cache: Optional[dict[str, list[dict]]] = None
 
 
 def _build_global_headers_map() -> dict[str, list[dict]]:
-    """Build a workspace-hash → [composer header entries] map from the global index.
+    """Build a workspace-hash → [composer header entries] map from the global DB.
+
+    Sources: the composer.composerHeaders index (Cursor 3.0-era builds) and
+    each chat's own composerData.workspaceIdentifier (current builds, which
+    have no central index). Index entries win when both exist.
 
     Returns a dict keyed by workspace directory hash (workspaceIdentifier.id).
-    Each value is a list of composer header dicts for that workspace.
     Cached for the lifetime of the process.
     """
+    from . import db
+
     global _global_headers_cache
     if _global_headers_cache is not None:
         return _global_headers_cache
 
     result: dict[str, list[dict]] = {}
-    for entry in get_global_composer_headers():
-        wi = entry.get("workspaceIdentifier", {})
-        ws_id = wi.get("id", "")
-        if ws_id:
-            result.setdefault(ws_id, []).append(entry)
+    global_db = get_global_db_path()
+    if global_db.exists():
+        try:
+            with db.CursorDB(global_db) as cdb:
+                headers = cdb.get_json("composer.composerHeaders", table="ItemTable")
+                indexed = headers.get("allComposers", []) if isinstance(headers, dict) else []
+                derived = cdb.composer_index()
+        except Exception:
+            indexed, derived = [], []
+        seen: set[str] = set()
+        for entry in indexed + derived:
+            cid = entry.get("composerId")
+            ws_id = (entry.get("workspaceIdentifier") or {}).get("id", "")
+            if cid and ws_id and cid not in seen:
+                seen.add(cid)
+                result.setdefault(ws_id, []).append(entry)
     _global_headers_cache = result
     return result
 
@@ -418,6 +399,9 @@ def list_workspaces_with_conversations() -> list[dict]:
         if composer_ids:
             ws["conversations"] = len(composer_ids)
             result.append(ws)
+    # Stable order (not last-modified) so a number shown by `cursaves
+    # workspaces` still refers to the same workspace in the next command.
+    result.sort(key=lambda w: (w["path"], w.get("host") or "", w["workspace_dir"].name))
     return result
 
 
@@ -454,10 +438,19 @@ def resolve_workspace(selector: str) -> Optional[dict]:
             if name == selector:
                 return ws
 
-    # Try as path substring
-    for ws in workspaces:
-        if selector in ws["path"]:
-            return ws
+    # Try as exact path, then as an unambiguous path substring
+    normalized = os.path.normpath(os.path.expanduser(selector))
+    exact = [ws for ws in workspaces if ws["path"] == normalized]
+    if len(exact) == 1:
+        return exact[0]
+    matches = exact or [ws for ws in workspaces if selector in ws["path"]]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        print(f"'{selector}' matches {len(matches)} workspaces:", file=sys.stderr)
+        for ws in matches:
+            print(f"  {ws['workspace_dir'].name[:8]}  {format_workspace_display(ws)}", file=sys.stderr)
+        print("Use the hash to pick one.", file=sys.stderr)
 
     return None
 
@@ -590,6 +583,14 @@ def get_project_identifier(project_path: str) -> str:
     if remote_url:
         return _normalize_remote_url(remote_url)
     return os.path.basename(os.path.normpath(project_path))
+
+
+@functools.lru_cache(maxsize=None)
+def remote_project_identifier(project_path: str) -> Optional[str]:
+    """Project identifier from the git remote, or None if there isn't one
+    (not a git repo, no origin, or the path doesn't exist on this machine)."""
+    url = _get_git_remote_url(project_path)
+    return _normalize_remote_url(url) if url else None
 
 
 def _get_git_remote_url(project_path: str) -> Optional[str]:

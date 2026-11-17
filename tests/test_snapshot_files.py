@@ -1,6 +1,6 @@
 import os
 
-from cursor_saves import export, importer, paths
+from cursor_saves import export, importer
 
 from chat_fixtures import write_snapshot
 

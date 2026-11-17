@@ -179,6 +179,14 @@ cursaves init --backend s3 --bucket my-cursor-saves --region us-east-1
 
 S3 avoids git history overhead and works well for large snapshot sets. Authentication uses the standard AWS credential chain.
 
+### How the backends reconcile snapshots
+
+Both backends work per chat, comparing each side against the state at the last sync:
+
+- **Git:** pulling moves onto the remote's latest commit and carries over your local snapshot changes (including commits whose push failed). If another machine pushed first, `push` re-syncs and retries automatically.
+- **S3:** a small manifest (`~/.config/cursaves/s3_manifest.json`) records what was last synced, so deletions propagate in both directions and a local change is never overwritten just because its file looks older.
+- If the same chat's snapshot changed on both sides, the remote snapshot is kept. Your chat is still in Cursor's database, so the next `sync` compares it again and, if both sides added messages, imports the other version as a separate copy (see below).
+
 ### Start syncing
 
 ```bash
@@ -233,11 +241,11 @@ cursaves watch -p /path/to/your/project
 
 # Options
 cursaves watch --interval 30     # check every 30s (default: 60)
-cursaves watch --no-git          # checkpoint only, no git push/pull
+cursaves watch --no-push         # checkpoint only, don't push (--no-git also works)
 cursaves watch --verbose         # log every check, not just changes
 ```
 
-The watch daemon polls for database changes, auto-checkpoints when conversations update, and commits + pushes to git. On the other end, it pulls and picks up new snapshots.
+The watch daemon polls for database changes, auto-checkpoints when conversations update, and pushes to the configured backend (git or S3). A failed push is retried on the next check. `watch` only exports: it never imports into Cursor (that needs Cursor closed), so run `cursaves sync` or `pull` on the other machine to bring chats in.
 
 ## How Cursor Stores Chat Data
 
@@ -265,14 +273,14 @@ Projects are identified by their **git remote origin URL**, not the local direct
 
 - `~/Projects/bob` and `~/repos/alice` with the same `origin` are treated as the same project -- conversations sync between them.
 - Two unrelated repos both named `myapp` won't collide, because their remotes differ.
-- Non-git directories fall back to matching by directory name.
+- Non-git directories fall back to matching by directory name. That fallback is only used when one side has no git remote: a chat from a repo is never imported into a different repo that happens to share its folder name.
 - Credentials and ports in the remote URL are ignored, so `https://user:token@host/org/repo`, `ssh://git@host:2222/org/repo` and `git@host:org/repo` all map to `host-org-repo`. (Before v0.10.0, URLs with credentials or a port produced a different folder name, which for credentials included the token itself. If you used such a remote, delete the old folder from `~/.cursaves/snapshots/` and consider rewriting the sync repo's history.)
 
 You can see what identity is being used with `cursaves status`.
 
 ### Path rewriting
 
-When importing conversations on a different machine, absolute file paths in conversation metadata (e.g., which files were attached as context) are automatically rewritten to match the target project path. The actual conversation content -- your messages and AI responses -- is fully portable with no modification.
+When importing conversations on a different machine, absolute file paths in conversation metadata (attached files, tool-call arguments, created files, file-state keys, including `file://` URIs) are rewritten to match the target project path. Only whole paths are rewritten: `/Users/you/app` is replaced in `/Users/you/app/src/x.py` but not inside `/Users/you/app-old`. Message text (your prompts and the AI's replies) and Cursor's encoded agent state are left exactly as written.
 
 For example, a conversation started on macOS at `/Users/you/Projects/myapp` will have its file references rewritten to `/home/you/repos/myapp` when imported on a Linux machine.
 
