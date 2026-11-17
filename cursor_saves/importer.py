@@ -3,7 +3,6 @@
 import gzip
 import json
 import os
-import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -102,29 +101,7 @@ def read_snapshot_meta(snapshot_path: Path) -> dict:
 
 
 def is_cursor_running() -> bool:
-    """Check if the main Cursor app process is running.
-
-    On macOS, pgrep -x fails because the comm field is truncated to 16
-    characters. Instead we parse `ps -axo args` and look for the main
-    Cursor executable while excluding helpers, crash handlers, and the
-    macOS CursorUIViewService system process.
-    """
-    try:
-        result = subprocess.run(
-            ["ps", "-axo", "args"],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            return False
-        for line in result.stdout.splitlines():
-            if "Cursor.app/Contents/MacOS/Cursor" in line \
-                    and "Helper" not in line \
-                    and "Frameworks" not in line:
-                return True
-        return False
-    except FileNotFoundError:
-        return False
+    return paths.is_cursor_running()
 
 
 _SKIP_REWRITE_KEYS = frozenset({"conversationState"})

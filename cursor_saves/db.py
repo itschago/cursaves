@@ -7,6 +7,34 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
+from . import paths
+
+
+class CursorRunningError(RuntimeError):
+    """Raised when a write to Cursor's databases is attempted while Cursor is open."""
+
+
+_allow_writes_while_running = False
+
+
+def allow_writes_while_cursor_running(allow: bool = True) -> None:
+    """Disable (or re-enable) the Cursor-running check for writes (--force)."""
+    global _allow_writes_while_running
+    _allow_writes_while_running = allow
+
+
+def ensure_cursor_closed() -> None:
+    """Raise CursorRunningError if Cursor is running and writes aren't forced.
+
+    Cursor keeps chat state in memory and rewrites its databases on exit,
+    so anything written while it is open can be silently overwritten.
+    """
+    if not _allow_writes_while_running and paths.is_cursor_running():
+        raise CursorRunningError(
+            "Cursor is running. Quit Cursor completely (Cmd+Q / File > Exit), "
+            "then re-run this command. Use --force to write anyway (not recommended)."
+        )
+
 
 class CursorDB:
     """Safe interface to a Cursor state.vscdb database.
@@ -162,6 +190,7 @@ class CursorDB:
     def _get_write_conn(self) -> sqlite3.Connection:
         """Get or create a connection for write operations on the ORIGINAL database."""
         if not hasattr(self, "_write_conn") or self._write_conn is None:
+            ensure_cursor_closed()
             self._write_conn = sqlite3.connect(str(self.db_path))
         return self._write_conn
 

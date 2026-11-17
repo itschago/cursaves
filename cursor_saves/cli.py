@@ -421,6 +421,7 @@ def cmd_checkpoint(args):
 
 def cmd_import(args):
     """Import conversation snapshots."""
+    db.ensure_cursor_closed()
     project_path = _resolve_project(args)
 
     if args.all:
@@ -919,6 +920,7 @@ def _pull_behind(sync_dir: Path) -> int:
 
 def cmd_repair(args):
     """Repair conversations with missing agent blobs by restoring from snapshots."""
+    db.ensure_cursor_closed()
     print("Scanning for missing blobs...")
     fixed, restored = repair_missing_blobs(verbose=True)
     if fixed > 0:
@@ -947,11 +949,18 @@ def cmd_sync(args):
 
     # Step 2: Import — pull behind conversations from snapshots into Cursor DBs
     print("\n── Pull ──")
-    imported = _pull_behind(sync_dir)
-    if imported > 0:
-        print(f"  Imported {imported} conversation(s)")
+    imported = 0
+    if not args.force and paths.is_cursor_running():
+        print(
+            "  Skipped: Cursor is running. Quit Cursor and re-run 'cursaves sync'\n"
+            "  to import remote chats (pushing still works while Cursor is open)."
+        )
     else:
-        print("  Everything up to date")
+        imported = _pull_behind(sync_dir)
+        if imported > 0:
+            print(f"  Imported {imported} conversation(s)")
+        else:
+            print("  Everything up to date")
 
     # Step 3: Push — export ahead conversations from Cursor DBs into snapshots
     print("\n── Push ──")
@@ -1074,6 +1083,7 @@ def _backend_pull() -> bool:
 def cmd_pull(args):
     """Pull + import snapshots in one command."""
     sync_dir = _require_sync_repo()
+    db.ensure_cursor_closed()
 
     # Step 1: Pull from remote
     if not _backend_pull():
@@ -1821,11 +1831,19 @@ def main():
     p_sync = subparsers.add_parser(
         "sync", help="Pull behind + push ahead — one command to stay in sync across machines"
     )
+    p_sync.add_argument(
+        "--force", action="store_true",
+        help="Import even if Cursor is running (not recommended)",
+    )
     p_sync.set_defaults(func=cmd_sync)
 
     # ── repair ─────────────────────────────────────────────────────
     p_repair = subparsers.add_parser(
         "repair", help="Restore missing agent blobs from snapshots (fixes 'Blob not found' errors)"
+    )
+    p_repair.add_argument(
+        "--force", action="store_true",
+        help="Skip the Cursor-running check",
     )
     p_repair.set_defaults(func=cmd_repair)
 
@@ -1932,6 +1950,8 @@ def main():
     p_purge.set_defaults(func=cmd_purge)
 
     args = parser.parse_args()
+    if getattr(args, "force", False):
+        db.allow_writes_while_cursor_running()
     if not args.command:
         print(
             "cursaves - sync Cursor chats between machines\n"
@@ -1980,7 +2000,11 @@ def main():
         )
         sys.exit(1)
 
-    args.func(args)
+    try:
+        args.func(args)
+    except db.CursorRunningError as e:
+        print(f"\nError: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

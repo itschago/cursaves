@@ -20,5 +20,10 @@ cursaves = "cursor_saves.cli:main"
 [tool.hatch.build.targets.wheel]
 packages = ["cursor_saves"]
 
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+]
+
 [project.urls]
 Repository = "https://github.com/Callum-Ward/cursaves"

@@ -57,6 +57,48 @@ def get_workspace_storage_dir() -> Path:
     return get_cursor_user_dir() / "workspaceStorage"
 
 
+def _is_cursor_main_process(args: str, system: str) -> bool:
+    """Return True if a `ps -o args` line is the main Cursor app process.
+
+    Helper processes (renderer, GPU, utility, zygote) are excluded: on macOS
+    they live under Frameworks/ and have "Helper" in their name; on Linux
+    Electron marks them with a --type= argument.
+    """
+    if system == "Darwin":
+        return (
+            re.search(r"/Cursor(?: [^/]*)?\.app/Contents/MacOS/", args) is not None
+            and "Helper" not in args
+            and "Frameworks" not in args
+        )
+    if "--type=" in args:
+        return False
+    exe = os.path.basename(args.split()[0]).lower() if args.split() else ""
+    return exe == "cursor" or (exe.startswith("cursor") and exe.endswith(".appimage"))
+
+
+def is_cursor_running() -> bool:
+    """Check if the main Cursor app process is running (macOS and Linux).
+
+    `pgrep -x` is unreliable on macOS because the comm field is truncated
+    to 16 characters, so we parse full command lines from `ps` instead.
+    """
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "args"],
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return False
+    if result.returncode != 0:
+        return False
+    system = platform.system()
+    return any(
+        _is_cursor_main_process(line.strip(), system)
+        for line in result.stdout.splitlines()
+    )
+
+
 def get_cursor_projects_dir() -> Path:
     """Return the path to ~/.cursor/projects/ (agent transcripts, etc.)."""
     return Path.home() / ".cursor" / "projects"
