@@ -1265,7 +1265,7 @@ def cmd_watch(args):
     watch_loop(
         project_path=project_path,
         interval=args.interval,
-        git_sync=not args.no_git,
+        push=not args.no_push,
         verbose=args.verbose,
     )
 
@@ -1939,8 +1939,8 @@ def main():
         help="Seconds between checks (default: 60)",
     )
     p_watch.add_argument(
-        "--no-git", action="store_true",
-        help="Disable automatic git commit/push",
+        "--no-push", "--no-git", dest="no_push", action="store_true",
+        help="Checkpoint only; don't push to the sync backend",
     )
     p_watch.add_argument("--verbose", "-v", action="store_true", help="Print on every check")
     p_watch.set_defaults(func=cmd_watch)

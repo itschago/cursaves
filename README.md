@@ -233,11 +233,11 @@ cursaves watch -p /path/to/your/project
 
 # Options
 cursaves watch --interval 30     # check every 30s (default: 60)
-cursaves watch --no-git          # checkpoint only, no git push/pull
+cursaves watch --no-push         # checkpoint only, don't push (--no-git also works)
 cursaves watch --verbose         # log every check, not just changes
 ```
 
-The watch daemon polls for database changes, auto-checkpoints when conversations update, and commits + pushes to git. On the other end, it pulls and picks up new snapshots.
+The watch daemon polls for database changes, auto-checkpoints when conversations update, and pushes to the configured backend (git or S3). A failed push is retried on the next check. `watch` only exports: it never imports into Cursor (that needs Cursor closed), so run `cursaves sync` or `pull` on the other machine to bring chats in.
 
 ## How Cursor Stores Chat Data
 

@@ -1,16 +1,15 @@
-"""Background daemon for automatic checkpoint + git sync."""
+"""Background daemon for automatic checkpoint + push to the sync backend."""
 
 import hashlib
 import os
 import signal
-import subprocess
 import sys
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
 from . import export, paths
+from .backends import get_backend
 
 
 def _get_db_fingerprint(project_path: str) -> Optional[str]:
@@ -46,121 +45,10 @@ def _get_db_fingerprint(project_path: str) -> Optional[str]:
     return hashlib.md5("|".join(parts).encode()).hexdigest()
 
 
-def _git_repo_root(snapshots_dir: Path = None) -> Optional[Path]:
-    """Return the sync repo root if it's a git repo."""
-    sync_dir = paths.get_sync_dir()
-    if (sync_dir / ".git").exists():
-        return sync_dir
-    return None
-
-
-def _git_has_remote(repo_root: Path) -> bool:
-    """Check if the git repo has a remote configured."""
-    try:
-        result = subprocess.run(
-            ["git", "remote"],
-            capture_output=True,
-            text=True,
-            cwd=str(repo_root),
-        )
-        return result.returncode == 0 and result.stdout.strip() != ""
-    except FileNotFoundError:
-        return False
-
-
-def _git_sync(repo_root: Path, project_path: str) -> tuple[bool, str]:
-    """Pull from remote, then add + commit + push snapshots.
-
-    Returns (success, message).
-    """
-    hostname = paths.get_machine_id()
-    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-    try:
-        # Pull first (rebase to keep history linear)
-        # Use explicit fetch + rebase to avoid "no tracking info" failures
-        subprocess.run(
-            ["git", "fetch", "origin"],
-            capture_output=True,
-            text=True,
-            cwd=str(repo_root),
-            timeout=30,
-        )
-        # Set up tracking if not already configured
-        subprocess.run(
-            ["git", "branch", "--set-upstream-to=origin/main", "main"],
-            capture_output=True,
-            cwd=str(repo_root),
-        )
-        pull_result = subprocess.run(
-            ["git", "rebase", "--autostash", "origin/main"],
-            capture_output=True,
-            text=True,
-            cwd=str(repo_root),
-            timeout=30,
-        )
-        if pull_result.returncode != 0:
-            return False, f"git pull failed: {pull_result.stderr.strip()}"
-
-        # Stage snapshot files
-        add_result = subprocess.run(
-            ["git", "add", "snapshots/"],
-            capture_output=True,
-            text=True,
-            cwd=str(repo_root),
-            timeout=10,
-        )
-        if add_result.returncode != 0:
-            return False, f"git add failed: {add_result.stderr.strip()}"
-
-        # Check if there's anything to commit
-        status_result = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
-            capture_output=True,
-            text=True,
-            cwd=str(repo_root),
-        )
-        if status_result.returncode == 0:
-            return True, "no changes to commit"
-
-        # Commit
-        project_name = os.path.basename(os.path.normpath(project_path))
-        commit_msg = f"[{hostname}] checkpoint {project_name} ({timestamp})"
-        commit_result = subprocess.run(
-            ["git", "commit", "-m", commit_msg],
-            capture_output=True,
-            text=True,
-            cwd=str(repo_root),
-            timeout=10,
-        )
-        if commit_result.returncode != 0:
-            return False, f"git commit failed: {commit_result.stderr.strip()}"
-
-        # Push
-        if _git_has_remote(repo_root):
-            push_result = subprocess.run(
-                ["git", "push", "-u", "origin", "HEAD"],
-                capture_output=True,
-                text=True,
-                cwd=str(repo_root),
-                timeout=30,
-            )
-            if push_result.returncode != 0:
-                return False, f"git push failed: {push_result.stderr.strip()}"
-            return True, "committed and pushed"
-        else:
-            return True, "committed (no remote configured)"
-
-    except subprocess.TimeoutExpired:
-        return False, "git operation timed out"
-    except Exception as e:
-        return False, f"git error: {e}"
-
-
 def watch_loop(
     project_path: str,
     interval: int = 60,
-    git_sync: bool = True,
+    push: bool = True,
     verbose: bool = False,
 ):
     """Main watch loop -- polls for changes and auto-checkpoints.
@@ -168,25 +56,26 @@ def watch_loop(
     Args:
         project_path: The project to watch.
         interval: Seconds between checks.
-        git_sync: Whether to auto-commit and push to git.
+        push: Whether to push checkpoints to the configured sync backend.
         verbose: Print status messages on every check.
     """
-    print(f"cursaves watch started")
+    backend = get_backend() if push else None
+    if backend is not None and not backend.is_initialized():
+        print("Warning: sync backend is not initialized (run `cursaves init`). Push disabled.")
+        backend = None
+
+    print("cursaves watch started")
     print(f"  Project: {project_path}")
     print(f"  Interval: {interval}s")
-    print(f"  Git sync: {'enabled' if git_sync else 'disabled'}")
+    print(f"  Push: {type(backend).__name__ if backend else 'disabled'}")
     print(f"  Machine: {paths.get_machine_id()}")
     print()
 
     snapshots_dir = paths.get_snapshots_dir()
-    repo_root = _git_repo_root(snapshots_dir) if git_sync else None
-
-    if git_sync and not repo_root:
-        print("Warning: snapshots directory is not in a git repo. Git sync disabled.")
-        git_sync = False
-
+    project_name = os.path.basename(os.path.normpath(project_path))
     last_fingerprint = _get_db_fingerprint(project_path)
     checkpoint_count = 0
+    push_pending = False
 
     # Handle graceful shutdown
     running = True
@@ -207,31 +96,33 @@ def watch_loop(
 
         current_fingerprint = _get_db_fingerprint(project_path)
 
-        if current_fingerprint == last_fingerprint:
-            if verbose:
-                print(f"[{_now()}] no changes detected")
-            continue
-
-        # Change detected -- checkpoint
-        print(f"[{_now()}] change detected, checkpointing...")
-        try:
-            saved = export.checkpoint_project(project_path)
-            if saved:
-                checkpoint_count += 1
-                print(f"[{_now()}] checkpointed {len(saved)} conversation(s) (total: {checkpoint_count})")
-
-                # Git sync
-                if git_sync and repo_root:
-                    success, msg = _git_sync(repo_root, project_path)
-                    print(f"[{_now()}] git: {msg}")
-            else:
-                if verbose:
+        if current_fingerprint != last_fingerprint:
+            print(f"[{_now()}] change detected, checkpointing...")
+            try:
+                saved = export.checkpoint_project(project_path)
+                if saved:
+                    checkpoint_count += 1
+                    push_pending = True
+                    print(f"[{_now()}] checkpointed {len(saved)} conversation(s) (total: {checkpoint_count})")
+                elif verbose:
                     print(f"[{_now()}] no conversations to checkpoint")
+            except Exception as e:
+                print(f"[{_now()}] error during checkpoint: {e}", file=sys.stderr)
+            last_fingerprint = current_fingerprint
+        elif verbose:
+            print(f"[{_now()}] no changes detected")
 
-        except Exception as e:
-            print(f"[{_now()}] error during checkpoint: {e}", file=sys.stderr)
-
-        last_fingerprint = current_fingerprint
+        # A failed push stays pending and is retried on the next tick.
+        if backend is not None and push_pending:
+            timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            msg = f"[{paths.get_machine_id()}] checkpoint {project_name} ({timestamp})"
+            try:
+                ok = backend.push(snapshots_dir, msg)
+            except Exception as e:
+                print(f"[{_now()}] push error: {e}", file=sys.stderr)
+                ok = False
+            push_pending = not ok
+            print(f"[{_now()}] push: {'ok' if ok else 'failed, will retry'}")
 
     print(f"\nwatch stopped. Total checkpoints: {checkpoint_count}")
 
