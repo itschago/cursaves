@@ -4,6 +4,7 @@ import json
 import shutil
 import sqlite3
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional
 
@@ -44,10 +45,18 @@ class CursorDB:
     the original file and require Cursor to be closed.
     """
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, direct: bool = False):
+        """*direct* reads the original file instead of a temp copy.
+
+        Use it only when Cursor is closed (e.g. during import), where
+        copying a multi-GB database for every lookup is pure overhead.
+        """
         self.db_path = db_path
+        self.direct = direct
         self._tmp_path: Optional[Path] = None
         self._conn: Optional[sqlite3.Connection] = None
+        self._write_conn: Optional[sqlite3.Connection] = None
+        self._in_transaction = False
 
     def _ensure_read_copy(self) -> sqlite3.Connection:
         """Copy the database to a temp file and open a read-only connection."""
@@ -56,6 +65,10 @@ class CursorDB:
 
         if not self.db_path.exists():
             raise FileNotFoundError(f"Database not found: {self.db_path}")
+
+        if self.direct:
+            self._conn = sqlite3.connect(f"{self.db_path.as_uri()}?mode=ro", uri=True)
+            return self._conn
 
         tmp_dir = tempfile.mkdtemp(prefix="cursaves-")
         tmp_db = Path(tmp_dir) / "state.vscdb"
@@ -74,7 +87,7 @@ class CursorDB:
         if self._conn:
             self._conn.close()
             self._conn = None
-        if hasattr(self, "_write_conn") and self._write_conn:
+        if self._write_conn:
             self._write_conn.close()
             self._write_conn = None
         if self._tmp_path:
@@ -130,8 +143,10 @@ class CursorDB:
         conn = self._ensure_read_copy()
         try:
             if prefix:
+                # A range on the unique key index; LIKE would scan the table.
+                upper = prefix[:-1] + chr(ord(prefix[-1]) + 1)
                 rows = conn.execute(
-                    f"SELECT key FROM {table} WHERE key LIKE ?", (prefix + "%",)
+                    f"SELECT key FROM {table} WHERE key >= ? AND key < ?", (prefix, upper)
                 ).fetchall()
             else:
                 rows = conn.execute(f"SELECT key FROM {table}").fetchall()
@@ -181,10 +196,37 @@ class CursorDB:
 
     def _get_write_conn(self) -> sqlite3.Connection:
         """Get or create a connection for write operations on the ORIGINAL database."""
-        if not hasattr(self, "_write_conn") or self._write_conn is None:
+        if self._write_conn is None:
             ensure_cursor_closed()
             self._write_conn = sqlite3.connect(str(self.db_path))
         return self._write_conn
+
+    @contextmanager
+    def transaction(self):
+        """Group writes into one transaction: all of them land, or none do."""
+        conn = self._get_write_conn()
+        conn.execute("BEGIN IMMEDIATE")
+        self._in_transaction = True
+        try:
+            yield self
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        finally:
+            self._in_transaction = False
+
+    def _begin(self, conn: sqlite3.Connection) -> None:
+        if not self._in_transaction:
+            conn.execute("BEGIN")
+
+    def _commit(self, conn: sqlite3.Connection) -> None:
+        if not self._in_transaction:
+            conn.execute("COMMIT")
+
+    def _rollback(self, conn: sqlite3.Connection) -> None:
+        if not self._in_transaction:
+            conn.execute("ROLLBACK")
 
     def write_item(self, key: str, value: str, table: str = "ItemTable"):
         """Write a value to the key-value store on the ORIGINAL database.
@@ -192,12 +234,7 @@ class CursorDB:
         This operates directly on the original file, not the temp copy.
         Caller must ensure Cursor is not running.
         """
-        conn = self._get_write_conn()
-        conn.execute(
-            f"INSERT OR REPLACE INTO {table} (key, value) VALUES (?, ?)",
-            (key, value),
-        )
-        conn.commit()
+        self.write_batch([(key, value)], table=table)
 
     def write_disk_kv(self, key: str, value: str):
         """Write a value to cursorDiskKV on the ORIGINAL database."""
@@ -214,15 +251,15 @@ class CursorDB:
         connection and one transaction for all items.
         """
         conn = self._get_write_conn()
-        conn.execute("BEGIN")
+        self._begin(conn)
         try:
             conn.executemany(
                 f"INSERT OR REPLACE INTO {table} (key, value) VALUES (?, ?)",
                 items,
             )
-            conn.execute("COMMIT")
+            self._commit(conn)
         except Exception:
-            conn.execute("ROLLBACK")
+            self._rollback(conn)
             raise
 
     def write_json_batch(self, items: list[tuple[str, Any]], table: str = "cursorDiskKV"):
@@ -241,7 +278,7 @@ class CursorDB:
         if not keys:
             return 0
         conn = self._get_write_conn()
-        conn.execute("BEGIN")
+        self._begin(conn)
         try:
             total = 0
             for batch_start in range(0, len(keys), 500):
@@ -251,10 +288,10 @@ class CursorDB:
                     f"DELETE FROM {table} WHERE key IN ({placeholders})", batch
                 )
                 total += cur.rowcount
-            conn.execute("COMMIT")
+            self._commit(conn)
             return total
         except Exception:
-            conn.execute("ROLLBACK")
+            self._rollback(conn)
             raise
 
     def delete_keys_by_prefix(self, prefix: str, table: str = "cursorDiskKV") -> int:
@@ -263,10 +300,15 @@ class CursorDB:
         Returns the number of rows deleted.
         """
         conn = self._get_write_conn()
-        cur = conn.execute(
-            f"DELETE FROM {table} WHERE key LIKE ?", (prefix + "%",)
-        )
-        conn.commit()
+        self._begin(conn)
+        try:
+            cur = conn.execute(
+                f"DELETE FROM {table} WHERE key LIKE ?", (prefix + "%",)
+            )
+            self._commit(conn)
+        except Exception:
+            self._rollback(conn)
+            raise
         return cur.rowcount
 
 

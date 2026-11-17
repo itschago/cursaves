@@ -189,7 +189,7 @@ def _init_workspace_db(db_path: Path):
 
 
 def _check_conflict(
-    global_db_path: Path,
+    cdb: Optional[db.CursorDB],
     composer_id: str,
     incoming_bubble_ids: set[str],
     incoming_header_ids: Optional[set[str]] = None,
@@ -208,12 +208,11 @@ def _check_conflict(
       "local_ahead"    - local has all incoming content plus more
       "diverged"       - both have content the other doesn't
     """
-    if not global_db_path.exists():
+    if cdb is None:
         return "new"
 
-    with db.CursorDB(global_db_path) as cdb:
-        local_keys = cdb.list_keys(f"bubbleId:{composer_id}:")
-        local_data = cdb.get_json(f"composerData:{composer_id}")
+    local_keys = cdb.list_keys(f"bubbleId:{composer_id}:")
+    local_data = cdb.get_json(f"composerData:{composer_id}")
 
     if not local_keys:
         return "new"
@@ -296,6 +295,31 @@ def import_snapshot(
         print(f"  Rewriting paths: {source_path} -> {target_path}")
         composer_data = rewrite_paths(composer_data, source_path, target_path)
 
+    global_db_path = paths.get_global_db_path()
+    # Import runs with Cursor closed, so read the DB in place rather than
+    # copying it for every lookup, and write each chat in one transaction.
+    global_cdb = db.CursorDB(global_db_path, direct=True)
+    try:
+        return _import_snapshot_data(
+            global_cdb, global_db_path, snapshot, composer_id, composer_data, headers,
+            source_path, target_path, target_workspace_dir, skip_backup,
+        )
+    finally:
+        global_cdb.close()
+
+
+def _import_snapshot_data(
+    global_cdb: db.CursorDB,
+    global_db_path: Path,
+    snapshot: dict,
+    composer_id: str,
+    composer_data: dict,
+    headers: list,
+    source_path: str,
+    target_path: str,
+    target_workspace_dir: Optional[Path],
+    skip_backup: bool,
+) -> bool:
     content_blobs = snapshot.get("contentBlobs", {})
     message_contexts = snapshot.get("messageContexts", {})
     bubble_entries = snapshot.get("bubbleEntries", {})
@@ -303,20 +327,19 @@ def import_snapshot(
     agent_blobs = snapshot.get("agentBlobs", {})
 
     # ── Conflict check ──────────────────────────────────────────────
-    global_db_path = paths.get_global_db_path()
     incoming_bubble_ids = set(bubble_entries.keys())
     incoming_header_ids = {
         h.get("bubbleId") for h in headers if h.get("bubbleId")
     }
+    existing_cdb = global_cdb if global_db_path.exists() else None
     conflict = _check_conflict(
-        global_db_path, composer_id, incoming_bubble_ids, incoming_header_ids,
+        existing_cdb, composer_id, incoming_bubble_ids, incoming_header_ids,
     )
     chat_name = composer_data.get("name", "Untitled")
     source_label = snapshot.get("sourceHost") or snapshot.get("sourceMachine") or "remote"
 
     if conflict == "local_ahead":
-        with db.CursorDB(global_db_path) as cdb:
-            ld = cdb.get_json(f"composerData:{composer_id}")
+        ld = global_cdb.get_json(f"composerData:{composer_id}")
         local_count = len((ld or {}).get("fullConversationHeadersOnly", []))
         snap_count = len(headers)
         print(
@@ -333,8 +356,7 @@ def import_snapshot(
         print(f"  New chat: \"{chat_name}\" ({len(headers)} msgs from {source_label})")
 
     if conflict == "incoming_newer":
-        with db.CursorDB(global_db_path) as cdb:
-            ld = cdb.get_json(f"composerData:{composer_id}")
+        ld = global_cdb.get_json(f"composerData:{composer_id}")
         local_count = len((ld or {}).get("fullConversationHeadersOnly", []))
         snap_count = len(headers)
         print(
@@ -354,7 +376,7 @@ def import_snapshot(
             f"  Diverged: \"{chat_name}\" — local and {source_label} both have unique messages"
         )
         copy_state = _check_conflict(
-            global_db_path, copy_id, incoming_bubble_ids, incoming_header_ids,
+            existing_cdb, copy_id, incoming_bubble_ids, incoming_header_ids,
         )
         if copy_state == "identical":
             print(f"            Separate copy \"{copy_name}\" is already up to date")
@@ -374,8 +396,16 @@ def import_snapshot(
         print(f"  Backed up global DB to {backup_path}")
 
     # ── Step 2: Write conversation data to global DB ────────────────
-    global_cdb = db.CursorDB(global_db_path)
-    try:
+    if source_path and source_path != target_path:
+        bubble_entries = {
+            bid: rewrite_paths(bdata, source_path, target_path)
+            for bid, bdata in bubble_entries.items()
+        }
+        checkpoints = {
+            cp_id: rewrite_paths(cp_data, source_path, target_path)
+            for cp_id, cp_data in checkpoints.items()
+        }
+    with global_cdb.transaction():
         # Write the main conversation data
         global_cdb.write_json(f"composerData:{composer_id}", composer_data)
 
@@ -392,13 +422,8 @@ def import_snapshot(
                 for msg_key, context in message_contexts.items()
             ])
 
-        # Write bubble entries in a single transaction (can be 50K+ entries)
+        # Write bubble entries (can be 50K+ entries)
         if bubble_entries:
-            if source_path and source_path != target_path:
-                bubble_entries = {
-                    bid: rewrite_paths(bdata, source_path, target_path)
-                    for bid, bdata in bubble_entries.items()
-                }
             global_cdb.write_json_batch([
                 (f"bubbleId:{composer_id}:{bubble_id}", bubble_data)
                 for bubble_id, bubble_data in bubble_entries.items()
@@ -406,11 +431,6 @@ def import_snapshot(
 
         # Write checkpoint data (workspace state snapshots for agent continuation)
         if checkpoints:
-            if source_path and source_path != target_path:
-                checkpoints = {
-                    cp_id: rewrite_paths(cp_data, source_path, target_path)
-                    for cp_id, cp_data in checkpoints.items()
-                }
             global_cdb.write_json_batch([
                 (f"checkpointId:{composer_id}:{cp_id}", cp_data)
                 for cp_id, cp_data in checkpoints.items()
@@ -423,8 +443,6 @@ def import_snapshot(
                 (f"agentKv:blob:{bid}", base64.b64decode(bdata))
                 for bid, bdata in agent_blobs.items()
             ])
-    finally:
-        global_cdb.close()
 
     # ── Step 3: Register conversation in workspace DB ───────────────
     if target_workspace_dir is not None:
@@ -437,35 +455,31 @@ def import_snapshot(
         backup_path = db.backup_db(ws_db_path)
         print(f"  Backed up workspace DB to {backup_path}")
 
-    _register_in_workspace(composer_id, composer_data, ws_dir)
+    _register_in_workspace(composer_id, composer_data, ws_dir, global_cdb)
 
     # ── Step 4: Verify writes ─────────────────────────────────────────
-    verify_cdb = db.CursorDB(global_db_path)
-    try:
-        written = verify_cdb.get_json(f"composerData:{composer_id}")
-        if not written:
-            print("  WARNING: composerData not found in global DB after write!", file=sys.stderr)
+    written = global_cdb.get_json(f"composerData:{composer_id}")
+    if not written:
+        print("  WARNING: composerData not found in global DB after write!", file=sys.stderr)
+        return False
+    if bubble_entries:
+        sample_key = next(iter(bubble_entries))
+        sample = global_cdb.get_json(f"bubbleId:{composer_id}:{sample_key}")
+        if not sample:
+            print("  WARNING: bubble entries not found in global DB after write!", file=sys.stderr)
             return False
-        if bubble_entries:
-            sample_key = next(iter(bubble_entries))
-            sample = verify_cdb.get_json(f"bubbleId:{composer_id}:{sample_key}")
-            if not sample:
-                print("  WARNING: bubble entries not found in global DB after write!", file=sys.stderr)
-                return False
 
-        final_name = composer_data.get("name", chat_name)
-        final_msgs = len(written.get("fullConversationHeadersOnly", []))
-        if conflict == "new":
-            print(f"  Imported: \"{final_name}\" ({final_msgs} msgs, {len(bubble_entries)} bubbles)")
-        elif conflict == "diverged":
-            sync_state.record_diverged_copy(composer_id)
-            print(f"  Copied: \"{final_name}\" ({final_msgs} msgs) — original \"{chat_name}\" left unchanged")
-        elif conflict == "incoming_newer":
-            print(f"  Updated: \"{final_name}\" → {final_msgs} msgs")
-        else:
-            print(f"  Done: \"{final_name}\" ({final_msgs} msgs)")
-    finally:
-        verify_cdb.close()
+    final_name = composer_data.get("name", chat_name)
+    final_msgs = len(written.get("fullConversationHeadersOnly", []))
+    if conflict == "new":
+        print(f"  Imported: \"{final_name}\" ({final_msgs} msgs, {len(bubble_entries)} bubbles)")
+    elif conflict == "diverged":
+        sync_state.record_diverged_copy(composer_id)
+        print(f"  Copied: \"{final_name}\" ({final_msgs} msgs) — original \"{chat_name}\" left unchanged")
+    elif conflict == "incoming_newer":
+        print(f"  Updated: \"{final_name}\" → {final_msgs} msgs")
+    else:
+        print(f"  Done: \"{final_name}\" ({final_msgs} msgs)")
 
     return True
 
@@ -903,14 +917,16 @@ def _register_in_global_headers(
     composer_id: str,
     composer_data: dict,
     ws_dir: Path,
+    global_cdb: Optional[db.CursorDB] = None,
 ) -> None:
     """Register a conversation in the global composer.composerHeaders index.
 
     This is the Cursor 3.0+ central index that maps chats to workspaces.
     Safe to call on any Cursor version — creates the index if absent.
     """
-    global_db_path = paths.get_global_db_path()
-    global_cdb = db.CursorDB(global_db_path)
+    owns_cdb = global_cdb is None
+    if owns_cdb:
+        global_cdb = db.CursorDB(paths.get_global_db_path())
     try:
         headers = global_cdb.get_json("composer.composerHeaders", table="ItemTable")
         if headers is None:
@@ -927,13 +943,15 @@ def _register_in_global_headers(
             global_cdb.write_json("composer.composerHeaders", headers, table="ItemTable")
             paths.invalidate_headers_cache()
     finally:
-        global_cdb.close()
+        if owns_cdb:
+            global_cdb.close()
 
 
 def _register_in_workspace(
     composer_id: str,
     composer_data: dict,
     ws_dir: Path,
+    global_cdb: Optional[db.CursorDB] = None,
 ) -> bool:
     """Register a conversation in a workspace's sidebar.
 
@@ -981,7 +999,7 @@ def _register_in_workspace(
 
         # Cursor 3.0+: register in the global headers index
         if is_migrated:
-            _register_in_global_headers(composer_id, composer_data, ws_dir)
+            _register_in_global_headers(composer_id, composer_data, ws_dir, global_cdb)
 
         return True
     finally:
