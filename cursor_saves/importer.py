@@ -688,18 +688,35 @@ def find_snapshot_dir_for_project(
     for project_dir in snapshots_dir.iterdir():
         if not project_dir.is_dir() or project_dir == exact or project_dir == basename_dir:
             continue
-        # Check first snapshot file for a matching source path basename
-        for sf in list_snapshot_files(project_dir):
-            try:
-                data = read_snapshot_file(sf)
-                source_path = data.get("sourceProjectPath", "")
-                if source_path and os.path.basename(os.path.normpath(source_path)) == basename:
-                    return project_dir
-            except (json.JSONDecodeError, OSError, gzip.BadGzipFile):
-                pass
-            break  # Only need to check one file per directory
+        files = list_snapshot_files(project_dir)
+        if not files:
+            continue
+        source_path = read_snapshot_meta(files[0]).get("sourceProjectPath") or ""
+        if not source_path or os.path.basename(os.path.normpath(source_path)) != basename:
+            continue
+        if workspace_accepts_snapshot_project(target_project_path, project_dir.name, {source_path}):
+            return project_dir
 
     return None
+
+
+def workspace_accepts_snapshot_project(
+    workspace_path: str, project_name: str, source_paths: set[str],
+) -> bool:
+    """Whether chats from a snapshot project may be imported into a workspace.
+
+    Folder-name matching is only trusted when one side has no git identity:
+    if the workspace is a git repo with a remote and the snapshot project
+    was also identified by a git remote, the identities must be equal.
+    (A snapshot project was identified by folder name when its name equals
+    the folder name of its source path, e.g. pushes from SSH workspaces.)
+    """
+    local_id = paths.remote_project_identifier(workspace_path)
+    if local_id is None:
+        return True
+    source_names = {os.path.basename(os.path.normpath(sp)) for sp in source_paths if sp}
+    snapshot_has_git_identity = project_name not in source_names
+    return not snapshot_has_git_identity or local_id == project_name
 
 
 def import_from_snapshot_dir(

@@ -1,5 +1,6 @@
 """Platform detection and Cursor storage path resolution."""
 
+import functools
 import json
 import os
 import platform
@@ -590,6 +591,14 @@ def get_project_identifier(project_path: str) -> str:
     if remote_url:
         return _normalize_remote_url(remote_url)
     return os.path.basename(os.path.normpath(project_path))
+
+
+@functools.lru_cache(maxsize=None)
+def remote_project_identifier(project_path: str) -> Optional[str]:
+    """Project identifier from the git remote, or None if there isn't one
+    (not a git repo, no origin, or the path doesn't exist on this machine)."""
+    url = _get_git_remote_url(project_path)
+    return _normalize_remote_url(url) if url else None
 
 
 def _get_git_remote_url(project_path: str) -> Optional[str]:

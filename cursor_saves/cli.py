@@ -26,6 +26,7 @@ from .importer import (
     read_snapshot_file,
     read_snapshot_meta,
     repair_missing_blobs,
+    workspace_accepts_snapshot_project,
 )
 
 
@@ -455,26 +456,38 @@ def cmd_import(args):
         sys.exit(1)
 
 
-def _select_target_workspaces(source_paths: set[str]) -> list[dict]:
+def _matching_workspaces_for_project(project: dict) -> list[dict]:
+    """Local workspaces that may receive a snapshot project's chats.
+
+    Candidates match a source path exactly or by folder name; candidates
+    that are a different git repo are excluded (see
+    workspace_accepts_snapshot_project).
+    """
+    source_paths = project.get("source_paths", set())
+    all_matches = []
+    seen_ws_dirs = set()
+    for sp in sorted(source_paths):
+        for ws in paths.find_all_matching_workspaces(sp):
+            ws_dir_str = str(ws["workspace_dir"])
+            if ws_dir_str in seen_ws_dirs:
+                continue
+            seen_ws_dirs.add(ws_dir_str)
+            if workspace_accepts_snapshot_project(ws["path"], project["name"], source_paths):
+                all_matches.append(ws)
+    return all_matches
+
+
+def _select_target_workspaces(project: dict) -> list[dict]:
     """Find and optionally prompt user to select target workspaces for import.
 
     Args:
-        source_paths: Set of source project paths from snapshots.
+        project: A snapshot project dict from list_snapshot_projects().
 
     Returns:
         List of workspace dicts to import into, or empty list if cancelled.
         Each dict has: type, host, path, workspace_dir
     """
-    # Find all matching workspaces across all source paths
-    all_matches = []
-    seen_ws_dirs = set()
-    for sp in sorted(source_paths):
-        matches = paths.find_all_matching_workspaces(sp)
-        for ws in matches:
-            ws_dir_str = str(ws["workspace_dir"])
-            if ws_dir_str not in seen_ws_dirs:
-                seen_ws_dirs.add(ws_dir_str)
-                all_matches.append(ws)
+    all_matches = _matching_workspaces_for_project(project)
 
     if not all_matches:
         return []
@@ -881,17 +894,7 @@ def _pull_behind(sync_dir: Path) -> int:
             if not behind_snapshots:
                 continue
 
-            # Find all matching workspaces for this project
-            all_matches = []
-            seen_ws_dirs: set[str] = set()
-            for sp in sorted(project.get("source_paths", set())):
-                matches = paths.find_all_matching_workspaces(sp)
-                for ws in matches:
-                    ws_dir_str = str(ws["workspace_dir"])
-                    if ws_dir_str not in seen_ws_dirs:
-                        seen_ws_dirs.add(ws_dir_str)
-                        all_matches.append(ws)
-
+            all_matches = _matching_workspaces_for_project(project)
             if not all_matches:
                 continue
 
@@ -1179,13 +1182,17 @@ def cmd_pull(args):
             print(f"\n  Importing {len(selected_files)} chat(s) from {project['name']}/...")
 
             # Find target workspace
-            target_workspaces = _select_target_workspaces(project["source_paths"])
+            target_workspaces = _select_target_workspaces(project)
 
             if not target_workspaces:
                 cwd = os.getcwd()
                 cwd_basename = os.path.basename(os.path.normpath(cwd))
                 source_basenames = {os.path.basename(os.path.normpath(sp)) for sp in project["source_paths"]}
-                if cwd_basename in source_basenames or project["name"] == paths.get_project_identifier(cwd):
+                same_repo = project["name"] == paths.get_project_identifier(cwd)
+                same_name = cwd_basename in source_basenames and workspace_accepts_snapshot_project(
+                    cwd, project["name"], project["source_paths"],
+                )
+                if same_repo or same_name:
                     target_path = cwd
                 else:
                     print(f"  No matching workspaces found.")
