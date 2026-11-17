@@ -191,7 +191,11 @@ cursaves pull              # pull + import into Cursor's database
 # Then restart Cursor to see the imported conversations
 ```
 
-The `sync` command pulls conversations where your local copy is behind the remote, then pushes conversations where your local copy is ahead — fully automatic, no prompts.
+The `sync` command pulls conversations where your local copy is behind the remote, then pushes conversations where your local copy is ahead — fully automatic, no prompts. Specifically:
+
+- **Pull:** imports chats that are new or have new messages on the remote. Skipped (with a warning) while Cursor is running; quit Cursor first, or pass `--force`.
+- **Push:** pushes chats with new local messages, plus chats that have never been pushed **in projects you've already pushed at least once**. Run `cursaves push` once in a project to opt it in to `sync`.
+- **Changed on both machines:** if a chat gained different messages on two machines, `sync` keeps your local chat unchanged and imports the other machine's version as a separate chat named `<name> (from <machine>)`. Later syncs update that same copy rather than creating new ones. `sync` never pushes over the other machine's version automatically; run `cursaves push` and select the chat if you want to replace the remote copy with yours.
 
 ## Commands
 
@@ -262,6 +266,7 @@ Projects are identified by their **git remote origin URL**, not the local direct
 - `~/Projects/bob` and `~/repos/alice` with the same `origin` are treated as the same project -- conversations sync between them.
 - Two unrelated repos both named `myapp` won't collide, because their remotes differ.
 - Non-git directories fall back to matching by directory name.
+- Credentials and ports in the remote URL are ignored, so `https://user:token@host/org/repo`, `ssh://git@host:2222/org/repo` and `git@host:org/repo` all map to `host-org-repo`. (Before v0.10.0, URLs with credentials or a port produced a different folder name, which for credentials included the token itself. If you used such a remote, delete the old folder from `~/.cursaves/snapshots/` and consider rewriting the sync repo's history.)
 
 You can see what identity is being used with `cursaves status`.
 
@@ -279,8 +284,9 @@ Note: "Developer: Reload Window" is not sufficient -- it reloads the renderer bu
 
 ## Safety
 
-- **Read operations** (`list`, `export`, `checkpoint`, `status`, `watch`) work on a temporary copy of the database. They never touch Cursor's files and are safe to run while Cursor is open.
-- **Write operations** (`import`, `pull`) back up the target database before writing, and refuse to run while Cursor is detected as running. Use `--force` to override (not recommended).
+- **Read operations** (`list`, `export`, `checkpoint`, `status`, `watch`, and the push half of `sync`) work on a consistent temporary copy of the database, made with SQLite's online backup API. They never modify Cursor's files and are safe to run while Cursor is open.
+- **Write operations** (`sync`, `pull`, `import`, `copy`, `repair`, `doctor --recover`, `migrate`, `purge`) refuse to write while Cursor is running, on both macOS and Linux. The check is enforced for every write to Cursor's databases, not per command. Use `--force` to override (not recommended: Cursor rewrites its databases on exit and can discard what was written).
+- **Backups:** before writing, the affected databases are backed up to `~/.local/share/cursaves/backups/<global|workspace-HASH>/state_<timestamp>.vscdb`. The two newest backups are kept, plus the first backup of each of the last three days, so running the tool again after a bad import can't remove the last good backup. To restore, quit Cursor and copy a backup over `state.vscdb` (deleting any `state.vscdb-wal` and `state.vscdb-shm` next to it).
 - Snapshots are self-contained JSON -- even if import goes wrong, you always have the raw data and the backup.
 
 ## Privacy Warning
@@ -386,16 +392,21 @@ The daemon handles checkpoint + git push/pull automatically. When you switch mac
   snapshots/
     github.com-user-repo/      # Identified by git remote URL
       <composer-id>.json.gz    # Self-contained conversation snapshot
+      <composer-id>.meta.json  # Name, message IDs, content hash (for fast status checks)
   .git/                        # Present when using git backend
 
 ~/.config/cursaves/
   config.json                  # Backend configuration (git, s3, etc.)
-  sync_state.json              # Tracks handled diverged snapshots
+  sync_state.json              # Per-machine: imported copies of diverged chats
+
+~/.local/share/cursaves/
+  backups/                     # Backups of Cursor DBs taken before each write
 
 ~/.local/bin/cursaves          # Global CLI tool (installed via uv)
 
 cursaves/                      # Source repo (this repo, public)
   cursor_saves/                # Python package
+  tests/                       # pytest suite (uses fake Cursor data, never your real DBs)
   docs/
   pyproject.toml
   LICENSE
@@ -404,6 +415,8 @@ cursaves/                      # Source repo (this repo, public)
 The tool code (this repo) is separate from your conversation data (`~/.cursaves/`). Install the tool once, point it at a private remote (git or S3), and sync from any project directory.
 
 ## Contributing
+
+Run the tests with `uv run pytest`.
 
 **Version bumps are required on every commit.** Users install via `uv tool install git+...` and update with `uv tool upgrade cursaves`. The upgrade command compares version numbers -- if the version doesn't change, it won't pull new code even with new commits.
 
