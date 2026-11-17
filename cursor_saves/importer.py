@@ -407,6 +407,14 @@ def _import_snapshot_data(
         backup_path = db.backup_db(global_db_path)
         print(f"  Backed up global DB to {backup_path}")
 
+    if target_workspace_dir is not None:
+        ws_dir = target_workspace_dir
+    else:
+        ws_dir = find_or_create_workspace(target_path)
+    # Current Cursor lists a workspace's chats by this field, so it must
+    # name the workspace on this machine, not the source machine's.
+    composer_data["workspaceIdentifier"] = _build_workspace_identifier(ws_dir)
+
     # ── Step 2: Write conversation data to global DB ────────────────
     if source_path and source_path != target_path:
         bubble_entries = {
@@ -464,12 +472,9 @@ def _import_snapshot_data(
                 (f"agentKv:blob:{bid}", base64.b64decode(bdata))
                 for bid, bdata in agent_blobs.items()
             ])
+    paths.invalidate_headers_cache()
 
     # ── Step 3: Register conversation in workspace DB ───────────────
-    if target_workspace_dir is not None:
-        ws_dir = target_workspace_dir
-    else:
-        ws_dir = find_or_create_workspace(target_path)
     ws_db_path = ws_dir / "state.vscdb"
 
     if not skip_backup and ws_db_path.exists():
@@ -922,6 +927,9 @@ def _build_workspace_identifier(ws_dir: Path) -> dict:
     except Exception:
         return {"id": ws_hash}
 
+    # Single-folder workspaces are identified by "uri", multi-root
+    # (.code-workspace) ones by "configPath".
+    is_multi_root = "folder" not in data and "workspace" in data
     folder_uri = data.get("folder", data.get("workspace", ""))
     if not folder_uri:
         return {"id": ws_hash}
@@ -940,7 +948,7 @@ def _build_workspace_identifier(ws_dir: Path) -> dict:
         uri_obj["scheme"] = "vscode-remote"
         uri_obj["authority"] = unquote(urlsplit(folder_uri).netloc)
 
-    return {"id": ws_hash, "uri": uri_obj}
+    return {"id": ws_hash, "configPath" if is_multi_root else "uri": uri_obj}
 
 
 def _register_in_global_headers(

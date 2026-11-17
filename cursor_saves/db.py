@@ -235,6 +235,36 @@ class CursorDB:
         prefix = header_chunk_prefix(composer_id)
         return resolve_headers(composer_data, lambda suffix: self.get_json(prefix + suffix))
 
+    _INDEX_FIELDS = ("name", "createdAt", "lastUpdatedAt", "unifiedMode", "forceMode")
+
+    def composer_index(self) -> list[dict]:
+        """Workspace and listing metadata for every chat in composerData.
+
+        Current Cursor associates a chat with its workspace through
+        ``composerData.workspaceIdentifier`` rather than a central index.
+        Fields are pulled with json_extract so large chats aren't parsed.
+        """
+        conn = self._ensure_read_copy()
+        paths_sql = ", ".join(
+            ["'$.workspaceIdentifier.id'"] + [f"'$.{f}'" for f in self._INDEX_FIELDS]
+        )
+        try:
+            rows = conn.execute(
+                f"SELECT substr(key, {len('composerData:') + 1}), json_extract(v, {paths_sql}) "
+                "FROM (SELECT key, CAST(value AS TEXT) AS v FROM cursorDiskKV "
+                "      WHERE key >= 'composerData:' AND key < 'composerData;') "
+                "WHERE json_valid(v)"
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        index = []
+        for cid, packed in rows:
+            ws_id, *values = json.loads(packed)
+            entry = {"composerId": cid, "workspaceIdentifier": {"id": ws_id} if ws_id else {}}
+            entry.update({f: v for f, v in zip(self._INDEX_FIELDS, values) if v is not None})
+            index.append(entry)
+        return index
+
     def get_header_chunks(self, composer_id: str) -> dict[str, list]:
         """Raw header chunks for a chat, keyed by chunk suffix ("000000", ...)."""
         prefix = header_chunk_prefix(composer_id)

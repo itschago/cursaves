@@ -329,6 +329,8 @@ Newer Cursor builds leave `fullConversationHeadersOnly` empty and keep the order
 
 The headers themselves (the same objects that used to be inline: `bubbleId`, `type`, `grouping`, timestamps) are stored in `cursorDiskKV` as JSON arrays of up to `chunkSize` entries, under `composerConvHeaders:{composerId}:{index}` with a zero-padded six-digit index (`000000`, `000001`, ...). Concatenating chunks `0 .. chunkCount-1` gives the full list; its length equals `headerLog.count`.
 
+These builds also have no `composer.composerHeaders` list in `ItemTable` (only a `composer.composerHeaders.version` stamp). Each chat names its workspace in `composerData.workspaceIdentifier` (`{"id": <workspaceStorage hash>, "uri": {...}}` for a folder, `"configPath"` instead of `"uri"` for a `.code-workspace`). cursaves reads that field to list a workspace's chats and, on import, rewrites it to the target machine's workspace.
+
 cursaves exports these chunks in the snapshot's `headerChunks` field (keyed by the six-digit index) and writes them back on import. Snapshots of chunked chats made before that change have a `headerLog` but no headers; import skips them and asks for the chat to be pushed again from its source machine.
 
 ## Checkpoint Data

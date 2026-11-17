@@ -276,50 +276,42 @@ def list_all_workspaces() -> list[dict]:
     return workspaces
 
 
-def get_global_composer_headers() -> list[dict]:
-    """Read the central composer.composerHeaders from the global DB.
-
-    Returns the allComposers list from composer.composerHeaders in the
-    global DB's ItemTable. In Cursor 3.0+ this is the authoritative
-    index of all chats, each tagged with a workspaceIdentifier.
-
-    Returns an empty list if not present (pre-3.0 Cursor).
-    """
-    from . import db
-
-    global_db = get_global_db_path()
-    if not global_db.exists():
-        return []
-    try:
-        with db.CursorDB(global_db) as cdb:
-            headers = cdb.get_json("composer.composerHeaders", table="ItemTable")
-            if headers and isinstance(headers, dict):
-                return headers.get("allComposers", [])
-    except Exception:
-        pass
-    return []
-
-
 _global_headers_cache: Optional[dict[str, list[dict]]] = None
 
 
 def _build_global_headers_map() -> dict[str, list[dict]]:
-    """Build a workspace-hash → [composer header entries] map from the global index.
+    """Build a workspace-hash → [composer header entries] map from the global DB.
+
+    Sources: the composer.composerHeaders index (Cursor 3.0-era builds) and
+    each chat's own composerData.workspaceIdentifier (current builds, which
+    have no central index). Index entries win when both exist.
 
     Returns a dict keyed by workspace directory hash (workspaceIdentifier.id).
-    Each value is a list of composer header dicts for that workspace.
     Cached for the lifetime of the process.
     """
+    from . import db
+
     global _global_headers_cache
     if _global_headers_cache is not None:
         return _global_headers_cache
 
     result: dict[str, list[dict]] = {}
-    for entry in get_global_composer_headers():
-        wi = entry.get("workspaceIdentifier", {})
-        ws_id = wi.get("id", "")
-        if ws_id:
-            result.setdefault(ws_id, []).append(entry)
+    global_db = get_global_db_path()
+    if global_db.exists():
+        try:
+            with db.CursorDB(global_db) as cdb:
+                headers = cdb.get_json("composer.composerHeaders", table="ItemTable")
+                indexed = headers.get("allComposers", []) if isinstance(headers, dict) else []
+                derived = cdb.composer_index()
+        except Exception:
+            indexed, derived = [], []
+        seen: set[str] = set()
+        for entry in indexed + derived:
+            cid = entry.get("composerId")
+            ws_id = (entry.get("workspaceIdentifier") or {}).get("id", "")
+            if cid and ws_id and cid not in seen:
+                seen.add(cid)
+                result.setdefault(ws_id, []).append(entry)
     _global_headers_cache = result
     return result
 
