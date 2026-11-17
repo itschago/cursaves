@@ -8,6 +8,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 
 def get_cursor_user_dir() -> Path:
@@ -601,26 +602,35 @@ def _get_git_remote_url(project_path: str) -> Optional[str]:
 def _normalize_remote_url(url: str) -> str:
     """Normalize a git remote URL to a stable, filesystem-safe directory name.
 
-    git@github.com:user/repo.git     → github.com-user-repo
-    https://github.com/user/repo.git → github.com-user-repo
-    ssh://git@github.com/user/repo   → github.com-user-repo
+    git@github.com:user/repo.git                → github.com-user-repo
+    https://github.com/user/repo.git            → github.com-user-repo
+    ssh://git@github.com/user/repo              → github.com-user-repo
+    https://user:token@github.com/user/repo.git → github.com-user-repo
+    ssh://git@host:2222/user/repo               → host-user-repo
+
+    Credentials and ports are always dropped: the identifier becomes a
+    directory name that is committed and pushed to the sync remote.
     """
-    # Strip trailing .git
+    url = url.strip().rstrip("/")
     url = re.sub(r"\.git$", "", url)
 
-    # SSH shorthand: git@host:user/repo
-    m = re.match(r"^[\w.-]+@([\w.-]+):(.*)", url)
+    # URL form: scheme://[user[:password]@]host[:port]/path
+    if "://" in url:
+        parsed = urlsplit(url)
+        host = (parsed.hostname or "").lower()
+        path = parsed.path.strip("/")
+        if host:
+            return _sanitize_identifier(f"{host}/{path}")
+        # e.g. file:///srv/git/repo
+        return _sanitize_identifier(path)
+
+    # scp-like SSH shorthand: [user@]host:path
+    m = re.match(r"^(?:[^@/]+@)?([\w.-]+):(?!/)(.*)", url)
     if m:
-        host, path = m.group(1), m.group(2)
+        host, path = m.group(1).lower(), m.group(2)
         return _sanitize_identifier(f"{host}/{path}")
 
-    # HTTPS / SSH URI: https://host/path or ssh://git@host/path
-    m = re.match(r"^(?:https?|ssh)://(?:[\w.-]+@)?([\w.-]+)/(.*)", url)
-    if m:
-        host, path = m.group(1), m.group(2)
-        return _sanitize_identifier(f"{host}/{path}")
-
-    # Unknown format -- sanitize whatever we got
+    # Local path or unknown format
     return _sanitize_identifier(url)
 
 
