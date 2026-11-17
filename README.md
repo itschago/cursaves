@@ -2,6 +2,8 @@
 
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-support-yellow?style=flat&logo=buy-me-a-coffee)](https://buymeacoffee.com/callumward)
 
+> This is a fork of [Callum-Ward/cursaves](https://github.com/Callum-Ward/cursaves) with sync-safety fixes and support for current Cursor's chat storage format. Install from this repository (see [Installation](#installation)); every machine you sync between should run the same fork version.
+
 Cursor stores chats locally. Switch machines and they're gone. This tool saves your chats to a git repo (or S3 bucket) so you can restore them anywhere — or copy them between workspaces on the same machine.
 
 ## How It Works
@@ -52,7 +54,7 @@ This means you can sync chats for the same repo across different machines, even 
 
 ```bash
 # Install globally (once per machine)
-uv tool install git+https://github.com/Callum-Ward/cursaves.git
+uv tool install git+https://github.com/itschago/cursaves.git
 
 # Initialize with a git remote (once per machine)
 cursaves init --remote git@github.com:you/my-cursaves.git
@@ -117,16 +119,16 @@ cadfb263-3326-4aff-8887-dcc12f736b11     Feedback on documentation...   agent   
 
 **Requirements:** Python 3.10+, [uv](https://docs.astral.sh/uv/), macOS or Linux, Git (for git backend). Zero required Python dependencies.
 
-**Tested with:** Cursor 2.6–3.0 (supports both old and new chat storage formats)
+**Tested with:** Cursor 2.6–3.0 and current builds that store message headers in chunks (`composerData` version 18); both old and new chat storage formats are supported
 
 ### Install as a global CLI tool (recommended)
 
 ```bash
 # Standard install (git backend only)
-uv tool install git+https://github.com/Callum-Ward/cursaves.git
+uv tool install git+https://github.com/itschago/cursaves.git
 
 # With S3 support
-uv tool install "cursaves[s3] @ git+https://github.com/Callum-Ward/cursaves.git"
+uv tool install "cursaves[s3] @ git+https://github.com/itschago/cursaves.git"
 ```
 
 This puts `cursaves` on your PATH so you can run it from any directory. Run this on each machine you want to sync between.
@@ -139,10 +141,16 @@ If `~/.local/bin` is not on your PATH, run `uv tool update-shell` or add it manu
 uv tool upgrade cursaves
 ```
 
+`upgrade` keeps using the repository you originally installed from. If you installed from the upstream `Callum-Ward/cursaves`, switch to this fork with:
+
+```bash
+uv tool install --force git+https://github.com/itschago/cursaves.git
+```
+
 ### Alternative: clone and run locally
 
 ```bash
-git clone git@github.com:Callum-Ward/cursaves.git
+git clone git@github.com:itschago/cursaves.git
 cd cursaves
 uv sync
 uv run cursaves <command>
@@ -173,7 +181,7 @@ This creates `~/.cursaves/` with a git repo and the remote configured. If you on
 3. Install with S3 support and initialize:
 
 ```bash
-uv tool install "cursaves[s3] @ git+https://github.com/Callum-Ward/cursaves.git"
+uv tool install "cursaves[s3] @ git+https://github.com/itschago/cursaves.git"
 cursaves init --backend s3 --bucket my-cursor-saves --region us-east-1
 ```
 

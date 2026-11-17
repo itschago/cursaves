@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "cursaves"
-version = "0.11.0"
+version = "0.11.1"
 description = "Sync Cursor agent chat sessions between machines"
 readme = "README.md"
 license = "AGPL-3.0-only"
@@ -26,7 +26,7 @@ dev = [
 ]
 
 [project.urls]
-Repository = "https://github.com/Callum-Ward/cursaves"
+Repository = "https://github.com/itschago/cursaves"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["tests"]
