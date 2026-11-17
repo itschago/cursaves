@@ -37,9 +37,10 @@ class SyncBackend(ABC):
         """
 
     @abstractmethod
-    def push(self, snapshots_dir: Path) -> bool:
+    def push(self, snapshots_dir: Path, message: Optional[str] = None) -> bool:
         """Upload local snapshots from *snapshots_dir* to the remote.
 
+        *message* describes the change where the backend records history.
         Returns True on success, False on failure.
         """
 
@@ -63,45 +64,38 @@ class GitBackend(SyncBackend):
 
     # -- SyncBackend interface ------------------------------------------
 
+    PUSH_ATTEMPTS = 3
+
     def pull(self, snapshots_dir: Path) -> bool:
         if not self.has_remote():
             return True
-        return self._reset_to_origin()
+        return self._sync_with_origin()
 
-    def push(self, snapshots_dir: Path) -> bool:
-        subprocess.run(
-            ["git", "add", "snapshots/"],
-            cwd=str(self.sync_dir), capture_output=True,
-        )
-        result = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
-            cwd=str(self.sync_dir), capture_output=True,
-        )
-        if result.returncode == 0:
-            return True  # nothing to commit
+    def push(self, snapshots_dir: Path, message: Optional[str] = None) -> bool:
+        self._commit_local_changes(message)
+        if not self.has_remote():
+            return True
 
-        from . import paths
-        hostname = paths.get_machine_id()
-        msg = f"[{hostname}] sync snapshots"
-        subprocess.run(
-            ["git", "commit", "-m", msg],
-            cwd=str(self.sync_dir), capture_output=True,
-        )
-
-        if self.has_remote():
+        for attempt in range(1, self.PUSH_ATTEMPTS + 1):
             try:
-                push_result = subprocess.run(
-                    ["git", "push", "-u", "origin", "main"],
-                    cwd=str(self.sync_dir),
-                    capture_output=True, text=True, timeout=120,
+                result = self._git(
+                    "push", "--no-verify", "-u", "origin", "HEAD:main", timeout=120,
                 )
-                if push_result.returncode != 0:
-                    print(f"  Push failed: {push_result.stderr.strip()}", file=sys.stderr)
-                    return False
             except subprocess.TimeoutExpired:
                 print("  Push timed out", file=sys.stderr)
                 return False
-        return True
+            if result.returncode == 0:
+                return True
+            rejected = any(
+                s in result.stderr for s in ("rejected", "non-fast-forward", "fetch first")
+            )
+            if not rejected or attempt == self.PUSH_ATTEMPTS:
+                print(f"  Push failed: {result.stderr.strip()}", file=sys.stderr)
+                return False
+            # Another machine pushed first: bring in its changes, keep ours, retry.
+            if not self._sync_with_origin():
+                return False
+        return False
 
     def has_remote(self) -> bool:
         try:
@@ -119,53 +113,130 @@ class GitBackend(SyncBackend):
 
     # -- Git-specific helpers -------------------------------------------
 
-    def _reset_to_origin(self) -> bool:
-        """Fetch + hard-reset to origin/main.  Remote is ground truth."""
+    def _git(self, *args: str, timeout: Optional[float] = None) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *args], cwd=str(self.sync_dir),
+            capture_output=True, text=True, timeout=timeout,
+        )
+
+    def _rev(self, ref: str) -> Optional[str]:
+        result = self._git("rev-parse", "--verify", "-q", ref)
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip() or None
+
+    def _tree_blobs(self, rev: Optional[str]) -> dict[str, str]:
+        """Map snapshots/ paths to blob ids at a commit ({} for None)."""
+        if rev is None:
+            return {}
+        out = self._git("ls-tree", "-r", "-z", "--full-tree", rev, "--", "snapshots/").stdout
+        blobs = {}
+        for entry in filter(None, out.split("\0")):
+            meta, path = entry.split("\t", 1)
+            blobs[path] = meta.split()[2]
+        return blobs
+
+    def _commit_local_changes(self, message: Optional[str] = None) -> bool:
+        """Commit any snapshot changes in the working tree. Returns True if committed."""
+        self._git("add", "-A", "snapshots/")
+        if self._git("diff", "--cached", "--quiet").returncode == 0:
+            return False
+        from . import paths
+        self._git(
+            "commit", "--no-verify", "-m",
+            message or f"[{paths.get_machine_id()}] sync snapshots",
+        )
+        return True
+
+    def _sync_with_origin(self) -> bool:
+        """Fetch origin/main and move onto it, carrying over local snapshot changes.
+
+        Local changes (unpushed commits and uncommitted files) are re-applied
+        one chat at a time. If the remote changed the same chat since the
+        last sync, the remote version is kept: snapshots are regenerated from
+        Cursor's DB, so the local chat is re-evaluated on the next sync.
+        """
+        import shutil
+        import tempfile
+
         if not self.sync_dir.exists():
             return False
 
-        for abort_cmd in (
-            ["git", "rebase", "--abort"],
-            ["git", "merge", "--abort"],
-            ["git", "cherry-pick", "--abort"],
-        ):
-            subprocess.run(abort_cmd, cwd=str(self.sync_dir), capture_output=True)
+        for abort_cmd in (("rebase", "--abort"), ("merge", "--abort"), ("cherry-pick", "--abort")):
+            self._git(*abort_cmd)
 
-        if not self.has_remote():
-            subprocess.run(
-                ["git", "checkout", "-f", "-B", "main"],
-                cwd=str(self.sync_dir), capture_output=True,
-            )
-            return True
-
+        base = self._rev("refs/remotes/origin/main")
         try:
-            fetch = subprocess.run(
-                ["git", "fetch", "--depth", "1", "origin"],
-                cwd=str(self.sync_dir),
-                capture_output=True, text=True, timeout=180,
-            )
-            if fetch.returncode != 0:
-                return False
-
-            subprocess.run(
-                ["git", "checkout", "-f", "-B", "main", "origin/main"],
-                cwd=str(self.sync_dir), capture_output=True,
-            )
-            subprocess.run(
-                ["git", "reset", "--hard", "origin/main"],
-                cwd=str(self.sync_dir), capture_output=True,
-            )
-            subprocess.run(
-                ["git", "branch", "--set-upstream-to=origin/main", "main"],
-                cwd=str(self.sync_dir), capture_output=True,
-            )
-            subprocess.run(
-                ["git", "clean", "-fd"],
-                cwd=str(self.sync_dir), capture_output=True,
-            )
-            return True
+            fetch = self._git("fetch", "--depth", "1", "origin", timeout=180)
         except subprocess.TimeoutExpired:
             return False
+        if fetch.returncode != 0:
+            heads = self._git("ls-remote", "--heads", "origin", timeout=60)
+            return heads.returncode == 0 and not heads.stdout.strip()  # empty remote
+        remote = self._rev("refs/remotes/origin/main")
+        if remote is None:
+            return True  # empty remote: nothing to pull
+
+        # Everything that differs locally from the last-synced remote state
+        self._git("add", "-A", "snapshots/")
+        if base is not None:
+            out = self._git(
+                "diff", "--cached", "--name-status", "--no-renames", "-z", base, "--", "snapshots/",
+            ).stdout
+            fields = [f for f in out.split("\0") if f]
+            changes = list(zip(fields[1::2], fields[0::2]))  # (path, status)
+        else:
+            out = self._git("ls-files", "-z", "--", "snapshots/").stdout
+            changes = [(p, "A") for p in out.split("\0") if p]
+
+        stash = Path(tempfile.mkdtemp(prefix="cursaves-git-"))
+        try:
+            for path, status in changes:
+                if status != "D":
+                    dest = stash / path
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(self.sync_dir / path, dest)
+
+            self._git("checkout", "-f", "-B", "main", "refs/remotes/origin/main")
+            self._git("reset", "--hard", "refs/remotes/origin/main")
+            self._git("branch", "--set-upstream-to=origin/main", "main")
+            self._git("clean", "-fd", "--", "snapshots/")
+
+            base_blobs, remote_blobs = self._tree_blobs(base), self._tree_blobs(remote)
+
+            def chat_key(path: str) -> str:
+                parent, _, name = path.rpartition("/")
+                return f"{parent}/{name.split('.', 1)[0]}"
+
+            groups: dict[str, list[tuple[str, str]]] = {}
+            for path, status in changes:
+                groups.setdefault(chat_key(path), []).append((path, status))
+
+            kept_remote = 0
+            for key, items in groups.items():
+                # every file of this chat at either revision
+                group_paths = {p for p in set(base_blobs) | set(remote_blobs) if chat_key(p) == key}
+                if any(base_blobs.get(p) != remote_blobs.get(p) for p in group_paths):
+                    kept_remote += 1
+                    continue
+                for path, status in items:
+                    target = self.sync_dir / path
+                    if status == "D":
+                        target.unlink(missing_ok=True)
+                    else:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(stash / path, target)
+        finally:
+            shutil.rmtree(stash, ignore_errors=True)
+
+        if kept_remote:
+            print(
+                f"  {kept_remote} chat(s) changed both here and on the remote since the last "
+                f"sync; kept the remote snapshot (local chats are re-checked on the next sync).",
+                file=sys.stderr,
+            )
+        self._commit_local_changes()
+        return True
 
     def init_repo(self, remote: Optional[str] = None):
         """Create the git repo and optionally add a remote."""
@@ -185,7 +256,7 @@ class GitBackend(SyncBackend):
             cwd=str(self.sync_dir), capture_output=True,
         )
         subprocess.run(
-            ["git", "commit", "-m", "Initialize cursaves sync repo"],
+            ["git", "commit", "--no-verify", "-m", "Initialize cursaves sync repo"],
             cwd=str(self.sync_dir), capture_output=True,
         )
 
@@ -299,7 +370,7 @@ class S3Backend(SyncBackend):
             print(f"S3 pull failed: {e}", file=sys.stderr)
             return False
 
-    def push(self, snapshots_dir: Path) -> bool:
+    def push(self, snapshots_dir: Path, message: Optional[str] = None) -> bool:
         """Upload local snapshot files that are newer or missing remotely."""
         client = self._get_client()
         try:

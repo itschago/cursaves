@@ -1095,9 +1095,7 @@ def _commit_and_push(sync_dir: Path, message: str) -> bool:
     """Push snapshot changes to the remote backend. Returns True on success."""
     backend = get_backend()
     snapshots_dir = paths.get_snapshots_dir()
-    if backend.has_remote():
-        return backend.push(snapshots_dir)
-    return True
+    return backend.push(snapshots_dir, message)
 
 
 def _backend_pull() -> bool:

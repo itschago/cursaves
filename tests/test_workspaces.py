@@ -92,7 +92,7 @@ def test_delete_select_completes_and_pushes(cursor_env, tmp_path, monkeypatch):
         def pull(self, d):
             return True
 
-        def push(self, d):
+        def push(self, d, message=None):
             pushed.append(d)
             return True
 
