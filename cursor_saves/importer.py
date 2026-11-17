@@ -3,6 +3,7 @@
 import gzip
 import json
 import os
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -105,30 +106,48 @@ def is_cursor_running() -> bool:
     return paths.is_cursor_running()
 
 
-_SKIP_REWRITE_KEYS = frozenset({"conversationState"})
+# conversationState is base64 protobuf; text/richText are the messages themselves.
+_SKIP_REWRITE_KEYS = frozenset({"conversationState", "text", "richText"})
+
+
+def _path_pattern(prefix: str) -> "re.Pattern[str]":
+    # Match the prefix only as a whole path: not when it is part of a longer
+    # name (/app vs /app-legacy) or sits inside another path (/srv/app).
+    return re.compile(r"(?<![\w.\-])" + re.escape(prefix) + r"(?![\w.\-])")
 
 
 def rewrite_paths(data: Any, old_prefix: str, new_prefix: str) -> Any:
-    """Recursively rewrite absolute paths in conversation data.
+    """Recursively rewrite a project root path in conversation data.
 
-    Replaces old_prefix with new_prefix in all string values that
-    look like file paths.  Skips binary/encoded fields like
-    ``conversationState`` (base64-encoded protobuf) that should
-    never be modified.
+    Rewrites the root wherever it appears as a whole path, in string values
+    and dict keys (e.g. originalFileStates is keyed by file URIs), in both
+    plain and percent-encoded (file:// URI) form. Message text and
+    encoded fields (see _SKIP_REWRITE_KEYS) are left unchanged.
     """
-    if isinstance(data, str):
-        if old_prefix in data:
-            return data.replace(old_prefix, new_prefix)
+    from urllib.parse import quote
+
+    old_prefix, new_prefix = old_prefix.rstrip("/"), new_prefix.rstrip("/")
+    if not old_prefix or old_prefix == new_prefix:
         return data
-    elif isinstance(data, dict):
+    subs = [(_path_pattern(old_prefix), new_prefix)]
+    if quote(old_prefix) != old_prefix:
+        subs.append((_path_pattern(quote(old_prefix)), quote(new_prefix)))
+    return _rewrite(data, subs)
+
+
+def _rewrite(data: Any, subs: list) -> Any:
+    if isinstance(data, str):
+        for pattern, replacement in subs:
+            data = pattern.sub(lambda _m: replacement, data)
+        return data
+    if isinstance(data, dict):
         return {
-            k: (v if k in _SKIP_REWRITE_KEYS else rewrite_paths(v, old_prefix, new_prefix))
+            _rewrite(k, subs): (v if k in _SKIP_REWRITE_KEYS else _rewrite(v, subs))
             for k, v in data.items()
         }
-    elif isinstance(data, list):
-        return [rewrite_paths(item, old_prefix, new_prefix) for item in data]
-    else:
-        return data
+    if isinstance(data, list):
+        return [_rewrite(item, subs) for item in data]
+    return data
 
 
 def find_or_create_workspace(project_path: str) -> Path:
