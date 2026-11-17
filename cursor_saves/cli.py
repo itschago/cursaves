@@ -1444,7 +1444,7 @@ def cmd_delete(args):
             total_deleted += p["count"]
             deleted_names.append(p["name"])
 
-        print(f"\nDeleted {total_deleted} snapshot(s) across {len(indices)} project(s).")
+        print(f"\nDeleted {total_deleted} snapshot(s) across {len(selected_projects)} project(s).")
 
         # Sync deletion to remote
         hostname = paths.get_machine_id()

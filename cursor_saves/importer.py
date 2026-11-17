@@ -148,7 +148,7 @@ def find_or_create_workspace(project_path: str) -> Path:
     ws_dir.mkdir(parents=True, exist_ok=True)
 
     # Create workspace.json
-    folder_uri = "file://" + os.path.normpath(project_path)
+    folder_uri = Path(os.path.normpath(project_path)).as_uri()
     ws_json = ws_dir / "workspace.json"
     ws_json.write_text(json.dumps({"folder": folder_uri}))
 
@@ -847,23 +847,18 @@ def _build_workspace_identifier(ws_dir: Path) -> dict:
         return {"id": ws_hash}
 
     uri_obj: dict = {"$mid": 1}
-    if folder_uri.startswith("file://"):
-        fs_path = folder_uri[len("file://"):].replace("%20", " ")
-        uri_obj["fsPath"] = fs_path
-        uri_obj["path"] = fs_path
-        uri_obj["external"] = folder_uri
-        uri_obj["scheme"] = "file"
-    elif folder_uri.startswith("vscode-remote://"):
-        parts = folder_uri.split("/", 3)
-        authority = parts[2] if len(parts) > 2 else ""
-        fs_path = "/" + parts[3] if len(parts) > 3 else "/"
-        uri_obj["fsPath"] = fs_path
-        uri_obj["path"] = fs_path
-        uri_obj["external"] = folder_uri
-        uri_obj["scheme"] = "vscode-remote"
-        uri_obj["authority"] = authority
-    else:
+    fs_path = paths.uri_to_path(folder_uri)
+    if fs_path is None:
         return {"id": ws_hash}
+    uri_obj["fsPath"] = fs_path
+    uri_obj["path"] = fs_path
+    uri_obj["external"] = folder_uri
+    if folder_uri.startswith("file://"):
+        uri_obj["scheme"] = "file"
+    else:
+        from urllib.parse import unquote, urlsplit
+        uri_obj["scheme"] = "vscode-remote"
+        uri_obj["authority"] = unquote(urlsplit(folder_uri).netloc)
 
     return {"id": ws_hash, "uri": uri_obj}
 
