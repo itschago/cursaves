@@ -577,6 +577,10 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
         "composerId": composer_id,
         "name": cd.get("name"),
         "messageCount": len(cd.get("fullConversationHeadersOnly", [])),
+        "headerIds": [
+            h["bubbleId"] for h in cd.get("fullConversationHeadersOnly", [])
+            if h.get("bubbleId")
+        ],
         "exportedAt": snapshot.get("exportedAt"),
         "sourceMachine": snapshot.get("sourceMachine"),
         "sourceHost": snapshot.get("sourceHost"),
