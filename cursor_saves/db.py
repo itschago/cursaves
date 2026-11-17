@@ -6,7 +6,7 @@ import sqlite3
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from . import paths
 
@@ -35,6 +35,40 @@ def ensure_cursor_closed() -> None:
             "Cursor is running. Quit Cursor completely (Cmd+Q / File > Exit), "
             "then re-run this command. Use --force to write anyway (not recommended)."
         )
+
+
+HEADER_CHUNK_PREFIX = "composerConvHeaders:"
+
+
+def header_chunk_prefix(composer_id: str) -> str:
+    return f"{HEADER_CHUNK_PREFIX}{composer_id}:"
+
+
+def resolve_headers(composer_data: dict, get_chunk: Callable[[str], Optional[list]]) -> list[dict]:
+    """A chat's message headers, in order.
+
+    Older Cursor keeps them inline in ``fullConversationHeadersOnly``.
+    composerData ``_v`` 18+ leaves that empty and stores them in chunks of
+    ``headerLog.chunkSize`` under ``composerConvHeaders:{id}:{000000..}``;
+    *get_chunk* is called with each 6-digit chunk suffix.
+    """
+    inline = composer_data.get("fullConversationHeadersOnly") or []
+    log = composer_data.get("headerLog")
+    if inline or not isinstance(log, dict):
+        return inline
+    headers: list[dict] = []
+    for i in range(int(log.get("chunkCount") or 0)):
+        headers.extend(get_chunk(f"{i:06d}") or [])
+    return headers
+
+
+def message_count(composer_data: dict) -> int:
+    """Number of messages in a chat, without reading header chunks."""
+    inline = composer_data.get("fullConversationHeadersOnly") or []
+    log = composer_data.get("headerLog")
+    if inline or not isinstance(log, dict):
+        return len(inline)
+    return int(log.get("count") or 0)
 
 
 class CursorDB:
@@ -191,6 +225,25 @@ class CursorDB:
             return json.loads(raw)
         except json.JSONDecodeError:
             return None
+
+    def get_conversation_headers(
+        self, composer_id: str, composer_data: Optional[dict] = None,
+    ) -> list[dict]:
+        """Message headers for a chat (inline or chunked, see resolve_headers)."""
+        if composer_data is None:
+            composer_data = self.get_json(f"composerData:{composer_id}") or {}
+        prefix = header_chunk_prefix(composer_id)
+        return resolve_headers(composer_data, lambda suffix: self.get_json(prefix + suffix))
+
+    def get_header_chunks(self, composer_id: str) -> dict[str, list]:
+        """Raw header chunks for a chat, keyed by chunk suffix ("000000", ...)."""
+        prefix = header_chunk_prefix(composer_id)
+        chunks = {}
+        for key in self.list_keys(prefix):
+            val = self.get_json(key)
+            if isinstance(val, list):
+                chunks[key[len(prefix):]] = val
+        return chunks
 
     # ── Write operations (on original file) ─────────────────────────
 

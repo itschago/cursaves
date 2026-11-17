@@ -259,8 +259,7 @@ def list_conversations(
             msg_count = 0
             conv_data = cdb.get_json(f"composerData:{composer_id}")
             if conv_data:
-                headers = conv_data.get("fullConversationHeadersOnly", [])
-                msg_count = len(headers)
+                msg_count = db.message_count(conv_data)
 
             results.append({
                 "id": composer_id,
@@ -485,6 +484,10 @@ def export_conversation(
             "transcript": get_transcript(project_path, composer_id),
             "messageContexts": contexts,
         }
+        # composerData _v 18+ keeps the message list outside composerData
+        header_chunks = _cdb.get_header_chunks(composer_id)
+        if header_chunks:
+            snapshot["headerChunks"] = header_chunks
 
         return snapshot
     finally:
@@ -602,17 +605,15 @@ def save_snapshot(snapshot: dict, snapshots_dir: Path) -> Path:
 
     # Write lightweight metadata sidecar (avoids decompressing for listings)
     cd = snapshot.get("composerData", {})
+    headers = db.resolve_headers(cd, (snapshot.get("headerChunks") or {}).get)
     num_shards = 0
     if len(compressed) > SHARD_SIZE_BYTES:
         num_shards = (len(compressed) + SHARD_SIZE_BYTES - 1) // SHARD_SIZE_BYTES
     meta = {
         "composerId": composer_id,
         "name": cd.get("name"),
-        "messageCount": len(cd.get("fullConversationHeadersOnly", [])),
-        "headerIds": [
-            h["bubbleId"] for h in cd.get("fullConversationHeadersOnly", [])
-            if h.get("bubbleId")
-        ],
+        "messageCount": len(headers),
+        "headerIds": [h["bubbleId"] for h in headers if h.get("bubbleId")],
         "exportedAt": snapshot.get("exportedAt"),
         "sourceMachine": snapshot.get("sourceMachine"),
         "sourceHost": snapshot.get("sourceHost"),

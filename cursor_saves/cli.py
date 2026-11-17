@@ -26,6 +26,7 @@ from .importer import (
     read_snapshot_file,
     read_snapshot_meta,
     repair_missing_blobs,
+    snapshot_headers,
     workspace_accepts_snapshot_project,
 )
 
@@ -398,8 +399,7 @@ def cmd_export(args):
     print(f"Saved to {saved_path}")
 
     # Show summary
-    data = snapshot["composerData"]
-    headers = data.get("fullConversationHeadersOnly", [])
+    headers = snapshot_headers(snapshot)
     blobs = snapshot.get("contentBlobs", {})
     print(f"  Messages: {len(headers)}")
     print(f"  Content blobs: {len(blobs)}")
@@ -684,7 +684,7 @@ def _find_ahead_conversations() -> tuple[list[dict], list[dict]]:
                 if not cd:
                     continue
                 if status == "never_pushed":
-                    has_content = cd.get("fullConversationHeadersOnly") or cd.get("name")
+                    has_content = db.message_count(cd) or cd.get("name")
                     if not (opted_in[project_id] and has_content):
                         continue
 
