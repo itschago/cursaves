@@ -821,10 +821,10 @@ def import_from_snapshot_dir(
         print(f"Importing {sf.name}...")
         if import_snapshot(sf, target_project_path, ws_dir, skip_backup=True):
             success += 1
-            print(f"  OK")
+            print("  OK")
         else:
             failure += 1
-            print(f"  FAILED")
+            print("  FAILED")
 
     return success, failure
 
@@ -864,7 +864,7 @@ def import_all_snapshots(
     if not project_snapshots:
         project_id = paths.get_project_identifier(target_project_path)
         print(f"No snapshots found for project '{project_id}'", file=sys.stderr)
-        print(f"Run 'cursaves snapshots' to see available snapshot projects.", file=sys.stderr)
+        print("Run 'cursaves snapshots' to see available snapshot projects.", file=sys.stderr)
         return 0, 0
 
     project_id = paths.get_project_identifier(target_project_path)
@@ -1819,8 +1819,8 @@ def purge_chats(
     """Delete chats and all their data from Cursor's databases.
 
     Removes from the global DB: composerData, bubbleId, checkpointId,
-    and messageRequestContext entries. Also removes from
-    composer.composerHeaders (3.0+) and workspace allComposers (2.x).
+    messageRequestContext and composerConvHeaders entries. Also removes
+    from composer.composerHeaders (3.0+) and workspace allComposers (2.x).
 
     Args:
         composer_ids: List of composer IDs to delete.
@@ -1850,29 +1850,35 @@ def purge_chats(
     cid_set = set(composer_ids)
     total_keys = 0
 
-    # Delete from global DB (cursorDiskKV)
-    write_cdb = db.CursorDB(global_db_path)
+    # Delete from global DB (cursorDiskKV). Content-addressed entries
+    # (agentKv:blob:, composer.content.) can be shared with other chats,
+    # e.g. a diverged copy and its original, so they are left in place.
+    write_cdb = db.CursorDB(global_db_path, direct=True)
     try:
-        for cid in composer_ids:
-            keys_deleted = 0
-            keys_deleted += write_cdb.delete_keys([f"composerData:{cid}"])
-            keys_deleted += write_cdb.delete_keys_by_prefix(f"bubbleId:{cid}:")
-            keys_deleted += write_cdb.delete_keys_by_prefix(f"checkpointId:{cid}:")
-            keys_deleted += write_cdb.delete_keys_by_prefix(f"messageRequestContext:{cid}:")
-            total_keys += keys_deleted
-
-        # Remove from composer.composerHeaders (global DB, ItemTable)
         headers = write_cdb.get_json("composer.composerHeaders", table="ItemTable")
-        if headers and "allComposers" in headers:
-            before = len(headers["allComposers"])
-            headers["allComposers"] = [
-                c for c in headers["allComposers"]
-                if c.get("composerId") not in cid_set
-            ]
-            if len(headers["allComposers"]) < before:
-                write_cdb.write_json(
-                    "composer.composerHeaders", headers, table="ItemTable"
-                )
+        with write_cdb.transaction():
+            for cid in composer_ids:
+                keys = [f"composerData:{cid}"]
+                for prefix in (
+                    f"bubbleId:{cid}:",
+                    f"checkpointId:{cid}:",
+                    f"messageRequestContext:{cid}:",
+                    db.header_chunk_prefix(cid),
+                ):
+                    keys.extend(write_cdb.list_keys(prefix))
+                total_keys += write_cdb.delete_keys(keys)
+
+            # Remove from composer.composerHeaders (global DB, ItemTable)
+            if headers and "allComposers" in headers:
+                before = len(headers["allComposers"])
+                headers["allComposers"] = [
+                    c for c in headers["allComposers"]
+                    if c.get("composerId") not in cid_set
+                ]
+                if len(headers["allComposers"]) < before:
+                    write_cdb.write_json(
+                        "composer.composerHeaders", headers, table="ItemTable"
+                    )
     finally:
         write_cdb.close()
 

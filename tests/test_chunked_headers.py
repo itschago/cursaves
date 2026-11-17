@@ -118,6 +118,18 @@ def test_import_rewrites_paths_in_header_chunks(project, tmp_path):
     assert h[0]["grouping"]["toolDisplayPath"] == f"{project['path']}/src/app.py"
 
 
+def test_purge_removes_header_chunks_only_for_purged_chat(project):
+    add_chat("c1", ["a", "b", "c"], chunked=True)
+    add_chat("c2", ["x", "y"], chunked=True)
+    deleted, keys = importer.purge_chats(["c1"])
+
+    assert deleted == 1
+    assert keys == 1 + 3 + 2  # composerData + bubbles + header chunks
+    assert all_chat_ids() == {"c2"}
+    assert local_header_chunk_keys("c1") == []
+    assert local_header_ids("c2") == ["x", "y"]
+
+
 def test_old_snapshot_without_chunks_is_not_imported(project, capsys):
     add_chat("c1", ["a", "b"], chunked=True)
     register_in_workspace(project["ws_dir"], ["c1"])

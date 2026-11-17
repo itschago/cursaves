@@ -289,9 +289,6 @@ def _trim_message_contexts(contexts: dict[str, Any], max_size_bytes: int) -> dic
     # Sort by key (message IDs are typically chronological or we keep all if small)
     sorted_keys = sorted(contexts.keys())
     
-    # Always keep the last N contexts
-    recent_keys = set(sorted_keys[-MAX_RECENT_CONTEXTS:])
-    
     # Calculate current size
     current_size = sum(len(json.dumps(v)) for v in contexts.values())
     
