@@ -11,7 +11,6 @@ backends just keep it in sync with a remote.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 from abc import ABC, abstractmethod
@@ -20,6 +19,12 @@ from typing import Optional
 
 
 _CONFIG_PATH = Path.home() / ".config" / "cursaves" / "config.json"
+
+
+def chat_key(path: str) -> str:
+    """Group a snapshot file path with the other files of the same chat."""
+    parent, _, name = path.rpartition("/")
+    return f"{parent}/{name.split('.', 1)[0]}"
 
 
 # ── Abstract base ────────────────────────────────────────────────────────
@@ -204,10 +209,6 @@ class GitBackend(SyncBackend):
 
             base_blobs, remote_blobs = self._tree_blobs(base), self._tree_blobs(remote)
 
-            def chat_key(path: str) -> str:
-                parent, _, name = path.rpartition("/")
-                return f"{parent}/{name.split('.', 1)[0]}"
-
             groups: dict[str, list[tuple[str, str]]] = {}
             for path, status in changes:
                 groups.setdefault(chat_key(path), []).append((path, status))
@@ -333,82 +334,201 @@ class S3Backend(SyncBackend):
 
     # -- SyncBackend interface ------------------------------------------
 
+    # Sync is three-way per chat: the manifest records each file's remote
+    # ETag and local MD5 as of the last sync, so we can tell which side
+    # changed (including deletions) instead of guessing from mtimes.
+
+    def _manifest_path(self) -> Path:
+        return _CONFIG_PATH.parent / "s3_manifest.json"
+
+    def _manifest_id(self) -> str:
+        return f"s3://{self.bucket}/{self.prefix}"
+
+    def _load_manifest(self) -> dict[str, dict]:
+        try:
+            data = json.loads(self._manifest_path().read_text())
+            return data.get(self._manifest_id(), {})
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_manifest(self, files: dict[str, dict]) -> None:
+        path = self._manifest_path()
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            data = {}
+        data[self._manifest_id()] = files
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+        tmp.replace(path)
+
+    def _list_remote(self, client) -> dict[str, str]:
+        """Map relative path -> ETag for every remote object under the prefix."""
+        remote = {}
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=self.prefix):
+            for obj in page.get("Contents", []):
+                rel = obj["Key"][len(self.prefix):]
+                if rel:
+                    remote[rel] = obj["ETag"].strip('"')
+        return remote
+
+    @staticmethod
+    def _list_local(snapshots_dir: Path) -> dict[str, str]:
+        """Map relative path -> MD5 for every local snapshot file."""
+        import hashlib
+
+        local = {}
+        if snapshots_dir.exists():
+            for p in snapshots_dir.rglob("*"):
+                if p.is_file():
+                    local[p.relative_to(snapshots_dir).as_posix()] = hashlib.md5(
+                        p.read_bytes()
+                    ).hexdigest()
+        return local
+
+    def _plan(self, snapshots_dir: Path, client):
+        """Yield (paths, local_changed, remote_changed, identical) per chat."""
+        local = self._list_local(snapshots_dir)
+        remote = self._list_remote(client)
+        base = self._load_manifest()
+
+        groups: dict[str, set[str]] = {}
+        for p in set(local) | set(remote) | set(base):
+            groups.setdefault(chat_key(p), set()).add(p)
+
+        plan = []
+        for paths in groups.values():
+            local_changed = any(local.get(p) != base.get(p, {}).get("md5") for p in paths)
+            remote_changed = any(remote.get(p) != base.get(p, {}).get("etag") for p in paths)
+            # single-part ETags are the MD5, so equal content is recognisable
+            identical = all(local.get(p) == remote.get(p) for p in paths)
+            plan.append((sorted(paths), local_changed, remote_changed, identical))
+        return plan, local, remote, base
+
+    @staticmethod
+    def _record(base: dict, path: str, etag: Optional[str], md5: Optional[str]) -> None:
+        if etag is None and md5 is None:
+            base.pop(path, None)
+        else:
+            base[path] = {"etag": etag, "md5": md5}
+
     def pull(self, snapshots_dir: Path) -> bool:
-        """Download all remote snapshot files that are newer or missing locally."""
+        """Apply remote changes since the last sync, including deletions.
+
+        If a chat also changed locally, the remote copy wins; the chat is
+        still in Cursor's DB, so the next sync re-evaluates it.
+        """
+        import hashlib
+
         client = self._get_client()
         try:
-            paginator = client.get_paginator("list_objects_v2")
-            pages = paginator.paginate(Bucket=self.bucket, Prefix=self.prefix)
-
-            downloaded = 0
-            for page in pages:
-                for obj in page.get("Contents", []):
-                    remote_key = obj["Key"]
-                    rel_path = remote_key[len(self.prefix):]
-                    if not rel_path:
-                        continue
-
-                    local_path = snapshots_dir / rel_path
-                    remote_mtime = obj["LastModified"].timestamp()
-
-                    if local_path.exists():
-                        local_mtime = local_path.stat().st_mtime
-                        local_size = local_path.stat().st_size
-                        if local_size == obj["Size"] and local_mtime >= remote_mtime:
-                            continue
-
-                    local_path.parent.mkdir(parents=True, exist_ok=True)
-                    client.download_file(self.bucket, remote_key, str(local_path))
-                    os.utime(str(local_path), (remote_mtime, remote_mtime))
-                    downloaded += 1
-
-            if downloaded:
-                print(f"  Downloaded {downloaded} file(s) from s3://{self.bucket}")
-            return True
-
+            plan, local, remote, base = self._plan(snapshots_dir, client)
         except Exception as e:
             print(f"S3 pull failed: {e}", file=sys.stderr)
             return False
 
+        downloaded = deleted = conflicts = 0
+        try:
+            for paths, local_changed, remote_changed, identical in plan:
+                if identical:
+                    for p in paths:
+                        self._record(base, p, remote.get(p), local.get(p))
+                    continue
+                if not remote_changed:
+                    continue
+                if local_changed:
+                    conflicts += 1
+                for p in paths:
+                    target = snapshots_dir / p
+                    if p in remote:
+                        body = client.get_object(
+                            Bucket=self.bucket, Key=self.prefix + p,
+                        )["Body"].read()
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        tmp = target.with_name(target.name + ".part")
+                        tmp.write_bytes(body)
+                        tmp.replace(target)
+                        self._record(base, p, remote[p], hashlib.md5(body).hexdigest())
+                        downloaded += 1
+                    else:
+                        if target.exists():
+                            target.unlink()
+                            deleted += 1
+                        self._record(base, p, None, None)
+        except Exception as e:
+            print(f"S3 pull failed: {e}", file=sys.stderr)
+            return False
+        finally:
+            self._save_manifest(base)
+
+        if downloaded or deleted:
+            print(
+                f"  Downloaded {downloaded} file(s), removed {deleted} "
+                f"from s3://{self.bucket}"
+            )
+        if conflicts:
+            print(
+                f"  {conflicts} chat(s) changed both here and in S3 since the last "
+                f"sync; kept the S3 snapshot (local chats are re-checked on the next sync).",
+                file=sys.stderr,
+            )
+        return True
+
     def push(self, snapshots_dir: Path, message: Optional[str] = None) -> bool:
-        """Upload local snapshot files that are newer or missing remotely."""
+        """Upload or delete chats changed locally since the last sync.
+
+        Chats that also changed in S3 are left alone until the next pull.
+        """
         client = self._get_client()
         try:
-            # Build index of remote objects
-            remote_index: dict[str, tuple[float, int]] = {}
-            paginator = client.get_paginator("list_objects_v2")
-            pages = paginator.paginate(Bucket=self.bucket, Prefix=self.prefix)
-            for page in pages:
-                for obj in page.get("Contents", []):
-                    rel = obj["Key"][len(self.prefix):]
-                    if rel:
-                        remote_index[rel] = (obj["LastModified"].timestamp(), obj["Size"])
-
-            uploaded = 0
-            for local_path in snapshots_dir.rglob("*"):
-                if not local_path.is_file():
-                    continue
-                rel = str(local_path.relative_to(snapshots_dir))
-                remote_key = self.prefix + rel
-
-                local_mtime = local_path.stat().st_mtime
-                local_size = local_path.stat().st_size
-
-                if rel in remote_index:
-                    remote_mtime, remote_size = remote_index[rel]
-                    if local_size == remote_size and local_mtime <= remote_mtime:
-                        continue
-
-                client.upload_file(str(local_path), self.bucket, remote_key)
-                uploaded += 1
-
-            if uploaded:
-                print(f"  Uploaded {uploaded} file(s) to s3://{self.bucket}")
-            return True
-
+            plan, local, remote, base = self._plan(snapshots_dir, client)
         except Exception as e:
             print(f"S3 push failed: {e}", file=sys.stderr)
             return False
+
+        uploaded = deleted = skipped = 0
+        try:
+            for paths, local_changed, remote_changed, identical in plan:
+                if identical:
+                    for p in paths:
+                        self._record(base, p, remote.get(p), local.get(p))
+                    continue
+                if not local_changed:
+                    continue
+                if remote_changed:
+                    skipped += 1
+                    continue
+                for p in paths:
+                    if p in local:
+                        resp = client.put_object(
+                            Bucket=self.bucket, Key=self.prefix + p,
+                            Body=(snapshots_dir / p).read_bytes(),
+                        )
+                        self._record(base, p, resp["ETag"].strip('"'), local[p])
+                        uploaded += 1
+                    elif p in remote:
+                        client.delete_object(Bucket=self.bucket, Key=self.prefix + p)
+                        self._record(base, p, None, None)
+                        deleted += 1
+                    else:
+                        self._record(base, p, None, None)
+        except Exception as e:
+            print(f"S3 push failed: {e}", file=sys.stderr)
+            return False
+        finally:
+            self._save_manifest(base)
+
+        if uploaded or deleted:
+            print(f"  Uploaded {uploaded} file(s), deleted {deleted} in s3://{self.bucket}")
+        if skipped:
+            print(
+                f"  Skipped {skipped} chat(s) that changed in S3 since the last pull; "
+                f"run `cursaves sync` to reconcile.",
+                file=sys.stderr,
+            )
+        return True
 
     def has_remote(self) -> bool:
         return True  # S3 is always remote
